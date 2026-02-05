@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Enhanced MultiHop Agent API</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .endpoint {
+            margin: 20px 0;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        h2 {
+            color: #555;
+            margin-top: 0;
+        }
+        .test-btn {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        .test-btn:hover {
+            background-color: #45a049;
+        }
+        .result {
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #f9f9f9;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            white-space: pre-wrap;
+            font-family: monospace;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Enhanced MultiHop Agent API</h1>
+        
+        <div class="endpoint">
+            <h2>1. 健康检查</h2>
+            <button class="test-btn" onclick="testHealthCheck()">测试健康检查</button>
+            <div id="health-result" class="result"></div>
+        </div>
+        
+        <div class="endpoint">
+            <h2>2. MCP服务列表</h2>
+            <button class="test-btn" onclick="testMcpList()">测试MCP服务列表</button>
+            <div id="mcp-list-result" class="result"></div>
+        </div>
+        
+        <div class="endpoint">
+            <h2>3. 调用Bing搜索</h2>
+            <input type="text" id="bing-query" placeholder="输入搜索查询，例如：北京天气" value="北京天气">
+            <button class="test-btn" onclick="testBingSearch()">测试Bing搜索</button>
+            <div id="bing-result" class="result"></div>
+        </div>
+        
+        <div class="endpoint">
+            <h2>4. 多跳推理</h2>
+            <input type="text" id="question" placeholder="输入问题，例如：法国的首都是什么？" value="法国的首都是什么？">
+            <button class="test-btn" onclick="testMultiHop()">测试多跳推理</button>
+            <div id="multi-hop-result" class="result"></div>
+        </div>
+    </div>
+    
+    <script>
+        const API_TOKEN = 'multihop_agent_token_2024';
+        const API_BASE = 'http://localhost:5000';
+        
+        function testHealthCheck() {
+            const resultDiv = document.getElementById('health-result');
+            resultDiv.textContent = '测试中...';
+            
+            fetch(`${API_BASE}/health`)
+                .then(response => response.json())
+                .then(data => {
+                    resultDiv.textContent = JSON.stringify(data, null, 2);
+                })
+                .catch(error => {
+                    resultDiv.textContent = `错误: ${error.message}`;
+                });
+        }
+        
+        function testMcpList() {
+            const resultDiv = document.getElementById('mcp-list-result');
+            resultDiv.textContent = '测试中...';
+            
+            fetch(`${API_BASE}/api/v1/mcp/list`)
+                .then(response => response.json())
+                .then(data => {
+                    resultDiv.textContent = JSON.stringify(data, null, 2);
+                })
+                .catch(error => {
+                    resultDiv.textContent = `错误: ${error.message}`;
+                });
+        }
+        
+        function testBingSearch() {
+            const query = document.getElementById('bing-query').value;
+            const resultDiv = document.getElementById('bing-result');
+            resultDiv.textContent = '测试中...';
+            
+            fetch(`${API_BASE}/api/v1/mcp/call`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${API_TOKEN}`
+                },
+                body: JSON.stringify({
+                    service: 'bing-search',
+                    query: query
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                resultDiv.textContent = JSON.stringify(data, null, 2);
+            })
+            .catch(error => {
+                resultDiv.textContent = `错误: ${error.message}`;
+            });
+        }
+        
+        function testMultiHop() {
+            const question = document.getElementById('question').value;
+            const resultDiv = document.getElementById('multi-hop-result');
+            resultDiv.textContent = '测试中...';
+            
+            fetch(`${API_BASE}/api/v1/answer`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${API_TOKEN}`
+                },
+                body: JSON.stringify({
+                    question: question,
+                    use_mcp: true
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                resultDiv.textContent = JSON.stringify(data, null, 2);
+            })
+            .catch(error => {
+                resultDiv.textContent = `错误: ${error.message}`;
+            });
+        }
+        
+        // 页面加载时自动测试健康检查
+        window.onload = function() {
+            testHealthCheck();
+        };
+    </script>
+</body>
+</html>
