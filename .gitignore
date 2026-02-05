@@ -40,9 +40,9 @@ logs/
 
 # Local config and data
 config.yaml
-mcp_config.json
 *.json
 !question.json
+!mcp_config.json
 
 # OS
 .DS_Store
