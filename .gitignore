@@ -38,6 +38,9 @@ env/
 logs/
 *.log
 
+# References (do not track)
+references/
+
 # Local config and data
 config.yaml
 *.json

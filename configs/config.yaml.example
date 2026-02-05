@@ -1,0 +1,34 @@
+api_token: "multihop_agent_token_2024"
+
+base_model:
+  api_url: "https://newapi.3173721.xyz/v1/chat/completions"
+  api_key: "YOUR_API_KEY"
+  model_id: "qwen3-max"
+  temperature: 0.7
+  max_tokens: 2048
+
+api_keys:
+  brave_api_key: "YOUR_BRAVE_API_KEY"
+  ofac_api_key: "YOUR_OFAC_API_KEY"
+
+neo4j_uri: "bolt://localhost:7687"
+neo4j_user: "neo4j"
+neo4j_password: "password"
+
+browser_config:
+  headless: true
+  timeout: 30
+
+top_k_retrieval: 5
+max_retries: 3
+
+search_agent:
+  max_queries: 4
+  per_query_delay: 0.2
+  max_results_per_query: 8
+  max_evidence: 6
+  adaptive_threshold_n: 0.5
+  brave_min_interval_seconds: 1.2
+  enable_rewrite: true
+  enable_llm_answer: true
+  enable_llm_verify: true

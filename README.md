@@ -18,7 +18,7 @@ The system follows a seven-layer architecture:
 +-------------------+
 |    Knowledge Layer|  -> Neo4j, Wikidata, LangChain Graph RAG (build-only)
 +-------------------+
-|    Retrieval Layer|  -> BM25, Contriever, Bing API
+|    Retrieval Layer|  -> BM25, Contriever, Brave API
 +-------------------+
 |     Input Layer   |  -> Receives questions from question.json
 +-------------------+
@@ -34,6 +34,16 @@ The system follows a seven-layer architecture:
 - **Executor**: Handles web interactions and external tool execution
 - **Answer Generator**: Produces competition-compliant structured answers
 
+## Project Structure
+
+- `src/`: Core agent logic and utilities
+- `apps/`: API / Web / Console entry points
+- `scripts/`: Helper scripts and test utilities
+- `configs/`: Configuration files (`config.yaml`, `mcp_config.json`)
+- `data/qa/`: Question and answer datasets
+- `docs/`: Design and strategy documents
+- `references/`: Reference projects and external code
+
 ## Installation
 
 1. Clone the repository
@@ -42,11 +52,17 @@ The system follows a seven-layer architecture:
    pip install -r requirements.txt
    ```
 3. Set up Neo4j database (local or remote)
-4. Configure API keys in `configs/config.yaml`
+4. Copy `configs/config.yaml.example` to `configs/config.yaml` and update API keys
 
 ## Usage
 
-The system can process questions from `question.json` and generate structured answers in the required format.
+The system can process questions from `data/qa/question.json` and generate structured answers in the required format.
+
+Common entry points:
+
+- API server: `apps/api/api_server.py` or `scripts/start_server.py`
+- Console: `apps/console/console_interface.py`
+- Web UI: `apps/web/web_interface.py`
 
 ## Compliance
 

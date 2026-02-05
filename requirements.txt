@@ -2,6 +2,7 @@
 
 # Core dependencies
 pyyaml>=6.0
+flask>=2.2.0
 
 # Retrieval dependencies
 rank_bm25>=0.2.2
