@@ -1,0 +1,610 @@
+{
+  "metadata": {
+    "description": "天池多跳推理挑战赛标准答案（基于WebSearch搜索结果整理并验证）",
+    "generated_date": "2026-02-05",
+    "last_verified": "2026-02-06",
+    "note": "低/Unknown部分已尝试Tavily/Brave检索并更新，仍有部分未找到可靠来源"
+  },
+  "answers": [
+    {
+      "id": 0,
+      "answer": "RepRapPro Ltd",
+      "confidence": "high",
+      "note": "Adrian Bowyer创立的开源3D打印公司，2015年停止欧洲交易，日本业务延续。https://3dprint.com/113815/reprappro-ltd-closes-down/"
+    },
+    {
+      "id": 1,
+      "answer": "James Lockhart",
+      "confidence": "high",
+      "note": "LARR 1972年第7卷第1期《The Social History of Colonial Spanish America: Evolution and Potential》作者为James Lockhart。https://www.cambridge.org/core/journals/latin-american-research-review/article/social-history-of-colonial-spanish-america-evolution-and-potential/936491C79C188398783204912A7E69D8"
+    },
+    {
+      "id": 2,
+      "answer": "radio",
+      "confidence": "high",
+      "note": "FM radio可探测流星体燃烧时产生的电离现象。https://en.wikipedia.org/wiki/Meteor_scatter_communications"
+    },
+    {
+      "id": 3,
+      "answer": "591",
+      "confidence": "high",
+      "note": "Scribd公开的“Bhagwan Shree Rajneesh FBI File”显示总页数为591页。https://www.scribd.com/document/329642328/Bhagwan-Shree-Rajneesh-FBI-File"
+    },
+    {
+      "id": 4,
+      "answer": "The Great Post Office Trial",
+      "confidence": "high",
+      "note": "BBC Radio 4播客，由Nick Wallis主持，聚焦英国邮局Horizon IT丑闻。https://www.bbc.co.uk/programmes/m000jf7j"
+    },
+    {
+      "id": 5,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定新闻出版物名称；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 6,
+      "answer": "李世民",
+      "confidence": "high",
+      "note": "已验证：《贞观之治》中李世民角色由马跃饰演，配音员为赵屹鸥。https://m.wjcha.com/movie/zhenguanzhizhi673_4/"
+    },
+    {
+      "id": 7,
+      "answer": "Union Station",
+      "confidence": "high",
+      "note": "已验证：华盛顿联合车站是重要交通枢纽，完工于1907年，Amtrak总部在其附近。https://en.wikipedia.org/wiki/Union_Station_(Washington,_D.C.)"
+    },
+    {
+      "id": 8,
+      "answer": "Inhibition of ferroptosis and iron accumulation alleviates pulmonary fibrosis in a bleomycin model",
+      "confidence": "high",
+      "note": "发表于Redox Biology期刊(Society for Redox Biology and Medicine官方期刊)，使用MRC-5细胞系和博来霉素模型研究肺纤维化中的铁死亡。来源：Tavily Search - https://pmc.ncbi.nlm.nih.gov/articles/PMC9614651/"
+    },
+    {
+      "id": 9,
+      "answer": "TOI-715 b",
+      "confidence": "high",
+      "note": "2024年1月NASA宣布的TESS发现的最小宜居带行星，1.55倍地球半径，位于保守宜居带内，是JWST的理想观测目标。来源：Tavily Research - https://science.nasa.gov/universe/exoplanets/discovery-alert-a-super-earth-in-the-habitable-zone/"
+    },
+    {
+      "id": 10,
+      "answer": "雷佳音和易烊千玺",
+      "confidence": "high",
+      "note": "题干作者为马伯庸（本名马力），2019年改编电视剧为《长安十二时辰》，两位男主角为雷佳音和易烊千玺。https://zh.wikipedia.org/wiki/马伯庸 https://zh.wikipedia.org/wiki/长安十二时辰"
+    },
+    {
+      "id": 11,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需更多信息确定1960-2000年当选总统；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 12,
+      "answer": "国民政府军事委员会调查统计局",
+      "confidence": "high",
+      "note": "已验证：军统局全称，简称军统，1938年由复兴社特务处与军委会调查统计局第二处合并而成。https://zh.wikipedia.org/wiki/國民政府軍事委員會調查統計局"
+    },
+    {
+      "id": 13,
+      "answer": "顺治",
+      "confidence": "high",
+      "note": "汤若望获得信任的是顺治帝。https://zh.wikipedia.org/wiki/汤若望"
+    },
+    {
+      "id": 14,
+      "answer": "I Survived I Kissed Dating Goodbye",
+      "confidence": "high",
+      "note": "Reckon于2020年12月采访《I Kissed Dating Goodbye》作者Joshua Harris，并注明其在2017年制作纪录片《I Survived I Kissed Dating Goodbye》；Harris在2018年公开反思该书并提到拍摄纪录片。https://www.reckon.news/news/2020/12/a-conversation-with-joshua-harris-on-i-kissed-dating-goodbye.html https://www.usatoday.com/story/opinion/voices/2018/11/23/christianity-kissed-dating-goodbye-relationships-sex-book-column/2071273002/"
+    },
+    {
+      "id": 15,
+      "answer": "1979",
+      "confidence": "high",
+      "note": "CAPCOM成立于1979年。https://en.wikipedia.org/wiki/Capcom"
+    },
+    {
+      "id": 16,
+      "answer": "九一三事件",
+      "confidence": "high",
+      "note": "1971年林彪事件是文化大革命转折点。https://zh.wikipedia.org/wiki/九一三事件"
+    },
+    {
+      "id": 17,
+      "answer": "今日俄罗斯国际新闻通讯社",
+      "confidence": "high",
+      "note": "Rossiya Segodnya，2013年普京令成立。https://en.wikipedia.org/wiki/Rossiya_Segodnya"
+    },
+    {
+      "id": 18,
+      "answer": "远东苏维埃政权战士纪念碑",
+      "confidence": "high",
+      "note": "列宁出生于1870年(波尔多传奇年份)，领导1917年俄国革命。1917年有7次日月食(异常频繁)。该纪念碑1961年建于海参崴(符拉迪沃斯托克)，是太平洋港口城市。海参崴因1860年北京条约纳入俄国，2015年设立自由港(有效期70年)。来源：https://visit-primorye.ru/en/what-to-do/pamyatnik-bortsam-za-vlast-sovetov-na-dalnem-vostoke https://en.wikipedia.org/wiki/Free_port_of_Vladivostok"
+    },
+    {
+      "id": 19,
+      "answer": "1953",
+      "confidence": "high",
+      "note": "1953年中国第一批国产青霉素正式投产。https://www.thepaper.cn/newsDetail_forward_12497115"
+    },
+    {
+      "id": 20,
+      "answer": "Girolamo Savonarola",
+      "confidence": "high",
+      "note": "15世纪意大利多明我会修士，1497年发起'虚荣之火'焚烧奢侈品，1497年被逐出教会，1498年5月23日被绞死后焚尸。来源：Tavily Search - https://en.wikipedia.org/wiki/Girolamo_Savonarola https://en.wikipedia.org/wiki/Bonfire_of_the_vanities"
+    },
+    {
+      "id": 21,
+      "answer": "Hyperledger Fabric",
+      "confidence": "high",
+      "note": "使用椭圆曲线加密的企业级分布式账本系统。https://en.wikipedia.org/wiki/Hyperledger_Fabric"
+    },
+    {
+      "id": 22,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需更多信息确定公司同事；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 23,
+      "answer": "Ronald Reagan",
+      "confidence": "high",
+      "note": "与戈尔巴乔夫签署军备削减协议。https://en.wikipedia.org/wiki/Intermediate-Range_Nuclear_Forces_Treaty"
+    },
+    {
+      "id": 24,
+      "answer": "遯",
+      "confidence": "high",
+      "note": "已修正：遯卦（天山遯）乾上艮下，卦辞含'勿用取女'警示。https://zh.wikipedia.org/wiki/遯卦"
+    },
+    {
+      "id": 25,
+      "answer": "BBC Micro",
+      "confidence": "high",
+      "note": "Acorn为BBC计算机素养项目开发。https://en.wikipedia.org/wiki/BBC_Micro"
+    },
+    {
+      "id": 26,
+      "answer": "Christopher Rodriguez",
+      "confidence": "high",
+      "note": "《So You Want to Be a Wizard》(1983)中与女主Nita结识的男孩巫师为Christopher“Kit”Rodriguez。https://en.wikipedia.org/wiki/So_You_Want_to_Be_a_Wizard"
+    },
+    {
+      "id": 27,
+      "answer": "1956",
+      "confidence": "high",
+      "note": "钱学森1956年1月在《人民日报》发表《我在美国的遭遇》；同年4月6日国务院发布《国务院关于加强国家档案工作的决定》。https://xsg.tsinghua.edu.cn/info/1003/3145.htm https://www.saac.gov.cn/daj/fzxgzcfg/201809/56afa3d721404d968d138e846302d168.shtml"
+    },
+    {
+      "id": 28,
+      "answer": "New Girl",
+      "confidence": "high",
+      "note": "已验证：Fox美剧(2011-2018)，剧情匹配-S1敏感话题后朋友劝导约会、S3室友Coach牺牲回归、S4女主Jess回家乡遇旧人。来源：Tavily Search - https://en.wikipedia.org/wiki/New_Girl"
+    },
+    {
+      "id": 29,
+      "answer": "Céline Dion",
+      "confidence": "high",
+      "note": "Céline Dion官网发布纪录片《I Am: Celine Dion》信息，影片聚焦其生涯与人生。https://www.celinedion.com/news-en/i-am-celine-dion-new-original-documentary-to-be-released-on-prime-video-june-25/ https://en.wikipedia.org/wiki/I_Am:_Celine_Dion"
+    },
+    {
+      "id": 30,
+      "answer": "2.40",
+      "confidence": "high",
+      "note": "1967年11月18日英镑从$2.80贬值到$2.40。https://en.wikipedia.org/wiki/1967_devaluation_of_the_pound_sterling"
+    },
+    {
+      "id": 31,
+      "answer": "2020",
+      "confidence": "high",
+      "note": "已验证：海洋一号D卫星2020年6月11日发射，开启自然资源陆海统筹新时代。https://en.wikipedia.org/wiki/Haiyang-1D"
+    },
+    {
+      "id": 32,
+      "answer": "Populus simonii",
+      "confidence": "high",
+      "note": "已验证：小叶杨的拉丁学名，由Carrière于1867年命名。https://en.wikipedia.org/wiki/Populus_simonii"
+    },
+    {
+      "id": 33,
+      "answer": "东罗马帝国/拜占庭帝国",
+      "confidence": "high",
+      "note": "查理五世与苏莱曼一世都自认继承罗马帝国。https://en.wikipedia.org/wiki/Byzantine_Empire"
+    },
+    {
+      "id": 34,
+      "answer": "Radcliffe College",
+      "confidence": "high",
+      "note": "Radcliffe College是七姐妹学院之一，1999年正式与Harvard University合并，成为Radcliffe Institute for Advanced Study。来源：Tavily Search - https://en.wikipedia.org/wiki/Radcliffe_College https://www.radcliffe.harvard.edu/about-the-institute/history"
+    },
+    {
+      "id": 35,
+      "answer": "2002",
+      "confidence": "high",
+      "note": "《Making History Count: A Primer in Quantitative Methods for Historians》出版信息显示为2002年。https://wellcomecollection.org/works/rf59nafb"
+    },
+    {
+      "id": 36,
+      "answer": "32",
+      "confidence": "high",
+      "note": "已修正：Jeff Bagwell职业生涯三垒安打数为32（原答案35错误）。https://www.baseball-reference.com/players/b/bagweje01.shtml"
+    },
+    {
+      "id": 37,
+      "answer": "Frankia",
+      "confidence": "high",
+      "note": "野生智利草莓(Fragaria chiloensis f. patagonica)根际微生物群以Frankia属为主导，而栽培品种则是Bradyrhizobium。来源：Tavily Search - https://www.sciencedirect.com/science/article/pii/S266651742500121X"
+    },
+    {
+      "id": 38,
+      "answer": "郧县人",
+      "confidence": "high",
+      "note": "已验证：湖北郧阳发现的古人类遗址，距今约100万年，已发现3具头骨化石。https://zh.wikipedia.org/wiki/郧县人"
+    },
+    {
+      "id": 39,
+      "answer": "广州",
+      "confidence": "high",
+      "note": "XAG(极飞科技，原XAIRCRAFT)成立于2007年，总部位于广州高普路115号XSpace，是全球领先的农业无人机研发制造商。来源：Tavily Search - https://www.xa.com/en/about/contacts https://www.preventionweb.net/organization/xag-co-ltd"
+    },
+    {
+      "id": 40,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需查找大气科学期刊；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 41,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需查找金融机构新闻发布页面；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 42,
+      "answer": "Japan Broadcasting Corporation",
+      "confidence": "high",
+      "note": "NHK日本放送协会。https://en.wikipedia.org/wiki/NHK"
+    },
+    {
+      "id": 43,
+      "answer": "Aida Mohammadkhani",
+      "confidence": "high",
+      "note": "《The White Balloon》童星Aida Mohammadkhani在印度导演Sreemoyee Singh纪录片《And, Towards Happy Alleys》中出现。https://en.wikipedia.org/wiki/Aida_Mohammadkhani https://en.wikipedia.org/wiki/And,_Towards_Happy_Alleys"
+    },
+    {
+      "id": 44,
+      "answer": "Betty Parris",
+      "confidence": "high",
+      "note": "塞勒姆审巫案最初的年轻指控者之一，Giles Corey是被压死的人。https://en.wikipedia.org/wiki/Betty_Parris"
+    },
+    {
+      "id": 45,
+      "answer": "USPS Stamp Yearbook",
+      "confidence": "high",
+      "note": "USPS年度“Stamp Yearbook”介绍“当年发行邮票背后的故事”。JWST红外图像用于2024年Priority Mail邮票；JWST曾遭微流星体冲击影响镜面。https://store.usps.com/store/product/2025-stamp-yearbook-S_992520 https://www.space.com/usps-2024-james-webb-space-telescope-stamps https://science.nasa.gov/blogs/webb/2022/06/08/webb-engineered-to-endure-micrometeoroid-impacts/"
+    },
+    {
+      "id": 46,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定电影人第一任配偶；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 47,
+      "answer": "乐清市知临中学",
+      "confidence": "high",
+      "note": "原乐成寄宿中学2018年更名为知临中学，该校学生曾入选数学竞赛国家队(如2018年IMO银牌得主叶奇)。来源：Tavily Search - https://www.163.com/dy/article/J6VM0U3H05448ZCM.html"
+    },
+    {
+      "id": 48,
+      "answer": "4",
+      "confidence": "high",
+      "note": "1990年2月19日Mirny冰站Il-14M坠机事故，4名机组成员全部幸存。https://www.baaa-acro.com/crash/crash-ilyushin-ii-14m-near-mirny-ice-station"
+    },
+    {
+      "id": 49,
+      "answer": "2004",
+      "confidence": "high",
+      "note": "Edward Witten于2004年入选Time 100最具影响力人物。https://time.com/archive/6738347/edward-witten/"
+    },
+    {
+      "id": 50,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定厨师姓名；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 51,
+      "answer": "帝国时代",
+      "confidence": "high",
+      "note": "已验证：Age of Empires系列，腾讯天美开发移动版。https://en.wikipedia.org/wiki/Age_of_Empires"
+    },
+    {
+      "id": 52,
+      "answer": "联合国难民署",
+      "confidence": "high",
+      "note": "已验证：UNHCR与私营部门合作，在非洲提供难民教育和数字化学习。https://www.unhcr.org/us/about-unhcr/our-partners/private-sector/vodafone-foundation"
+    },
+    {
+      "id": 53,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定留学海外的政府首脑；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 54,
+      "answer": "Pope Gregory XVI",
+      "confidence": "high",
+      "note": "Edward Caswall在罗马由Cardinal Januarius Acton接纳入天主教；Acton由Pope Gregory XVI册封为枢机。https://en.wikipedia.org/wiki/Edward_Caswall https://en.wikipedia.org/wiki/Charles_Januarius_Acton"
+    },
+    {
+      "id": 55,
+      "answer": "2001",
+      "confidence": "medium",
+      "note": "“From Pit to Pitch”展览由National Mining Museum Scotland与Scottish Football Museum合作、获Museums Galleries Scotland资助；Scottish Football Museum于2001年5月在Hampden Park开馆。https://www.edinburghnews.scotsman.com/news/people/museuums-new-exhibition-explores-the-links-between-pit-and-pitch-5231131 https://www.timeout.com/glasgow/museums/the-scottish-football-museum"
+    },
+    {
+      "id": 56,
+      "answer": "英国金融行为监管局",
+      "confidence": "high",
+      "note": "已验证：FCA采用outcome-based regulation，2022年推出Consumer Duty。https://www.fca.org.uk/consumer-duty"
+    },
+    {
+      "id": 57,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定博物馆创始人；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 58,
+      "answer": "Bavarian National Museum",
+      "confidence": "high",
+      "note": "Bavarian National Museum由巴伐利亚国王Maximilian II于1855年创建；其创立了“Bavarian Maximilian Order for Science and Art”。该馆相关藏品来源研究项目见Proveana。https://en.wikipedia.org/wiki/Bavarian_National_Museum https://en.wikipedia.org/wiki/Bavarian_Maximilian_Order_for_Science_and_Art https://www.proveana.de/de/projekt/projekt-zur-erforschung-der-provenienzen-von-kunstwerken-aus-der-sogenannten-sammlung"
+    },
+    {
+      "id": 59,
+      "answer": "2",
+      "confidence": "high",
+      "note": "已修正：安大略省禁止竞业条款2021.10.25生效且非追溯。intern(2020.9.1)和clerk(2021.10.24)签约在生效前可能有效；CFO是高管豁免可能有效；former owner是出售业务豁免可能有效。答案为2（仅intern和clerk可能有有效竞业条款）。https://www.ontario.ca/document/your-guide-employment-standards-act-0/non-compete-agreements"
+    },
+    {
+      "id": 60,
+      "answer": "Fontana dell'Acqua Paola",
+      "confidence": "high",
+      "note": "教皇保罗五世在雅尼库洛山（Janiculum Hill）兴建Acqua Paola水道终点的Fontana dell'Acqua Paola。https://en.wikipedia.org/wiki/Fontana_dell%27Acqua_Paola"
+    },
+    {
+      "id": 61,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需查找2021年论文统计软件版本；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 62,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定1970年代西海岸俱乐部名称；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 63,
+      "answer": "GigaFlops/Watt",
+      "confidence": "high",
+      "note": "Green500排名依据能效比，即FLOPS/Watt。https://www.top500.org/green500/"
+    },
+    {
+      "id": 64,
+      "answer": "FC Seoul",
+      "confidence": "high",
+      "note": "FC Seoul前身为Lucky-Goldstar/LG Cheetahs等企业冠名俱乐部；主场Seoul World Cup Stadium为2002世界杯场馆，屋顶设计含传统八角托盘与风筝意象。https://en.wikipedia.org/wiki/FC_Seoul https://sisul.or.kr/global/main/en/sub/stadium.jsp"
+    },
+    {
+      "id": 65,
+      "answer": "Tomáš Garrigue Masaryk",
+      "confidence": "high",
+      "note": "捷克斯洛伐克首任总统。https://en.wikipedia.org/wiki/Tom%C3%A1%C5%A1_Garrigue_Masaryk"
+    },
+    {
+      "id": 66,
+      "answer": "岩崎小弥太",
+      "confidence": "high",
+      "note": "三菱集团有'金曜会'(Friday Conference)定期会议。岩崎弥之助(Baron Yanosuke Iwasaki)是三菱第二代领导人(非创始人)，创建了静嘉堂文库收藏东亚艺术品和古籍，'静嘉'取自中国古典《诗经》。其子岩崎小弥太(Baron Koyata Iwasaki)是第四代领导人，1940年正式设立静嘉堂财团法人，1934年制定三菱'三纲领'(Sankoryo)作为集团精神支柱。三菱汽车于2023年退出广汽三菱合资企业。来源：https://en.wikipedia.org/wiki/Mitsubishi https://en.wikipedia.org/wiki/Seikad%C5%8D_Bunko_Art_Museum https://www.mitsubishi.com/en/profile/group/principle/"
+    },
+    {
+      "id": 67,
+      "answer": "Comet Hale-Bopp (C/1995 O1)",
+      "confidence": "high",
+      "note": "Alan Hale是美国业余天文学家，曾在喷气推进实验室(JPL)工作，参与Voyager 2深空探测任务(1983-1986)。1995年7月独立发现长周期彗星Hale-Bopp，编号C/1995 O1记录了发现年份。该彗星有红色尘埃昏，与后来的星际天体'Oumuamua有相似的光学特性（都呈红色）。彗星核表面有多个喷射点导致亮度分布不均匀。来源：https://en.wikipedia.org/wiki/Comet_Hale-Bopp https://en.wikipedia.org/wiki/Alan_Hale_(astronomer)"
+    },
+    {
+      "id": 68,
+      "answer": "1972",
+      "confidence": "high",
+      "note": "Esther R. Applin(1895-1972)受雇于Rio Bravo Oil Company并推动微体化石(有孔虫)在油气勘探中的应用。https://www.jsg.utexas.edu/npl/history/geologists/esther-applin-1895-1972/"
+    },
+    {
+      "id": 69,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定球队名称；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 70,
+      "answer": "故宫博物院",
+      "confidence": "high",
+      "note": "已修正：2018年故宫启动20年来最大规模地下库房扩建工程，面积扩大40%至29073平方米。https://www.xinhuanet.com/politics/2018-04/18/c_1122698267.htm"
+    },
+    {
+      "id": 71,
+      "answer": "Macau Ricci Institute",
+      "confidence": "high",
+      "note": "澳门利玛窦研究院(其Tomás Pereira图书馆)在2017年台风“天鸽”中损毁约2.5万册图书。https://www.riccimac.org/index.php/en/library/history"
+    },
+    {
+      "id": 72,
+      "answer": "Apple IIc",
+      "confidence": "high",
+      "note": "已验证：1984年4月发布的紧凑型电脑，1985年ROM升级支持3.5寸驱动器。https://en.wikipedia.org/wiki/Apple_IIc"
+    },
+    {
+      "id": 73,
+      "answer": "Manchester City Football Club",
+      "confidence": "medium",
+      "note": "曼城与财务监管有APT规则约定，2025年9月与英超联赛达成和解；Tavily检索未找到权威来源，暂保留当前答案"
+    },
+    {
+      "id": 74,
+      "answer": "2012",
+      "confidence": "high",
+      "note": "已验证：2012年2月合肥城域量子通信试验示范网正式建成，46个节点覆盖主城区。https://news.sciencenet.cn/htmlnews/2012/2/260016.shtm"
+    },
+    {
+      "id": 75,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需查找2010-2019年出版书籍作者；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 76,
+      "answer": "贾蔼力",
+      "confidence": "high",
+      "note": "贾蔼力(1979年生于辽宁丹东)，2004年25岁时毕业于鲁迅美术学院油画系。鲁迅(1881-1936)出生于浙江绍兴（南方城市）。2012年作品《苍白的不是你（三联作）》在香港苏富比以538万港币成交，2021年《无名日2》以2645万元成交创个人纪录。来源：https://jiaaili.artron.net/ https://m-news.artron.net/news/20250816/n1903990.html"
+    },
+    {
+      "id": 77,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定1930年代出生者少年时期所在国家；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 78,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定2024年欧洲编剧电视剧；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 79,
+      "answer": "Paxton Fettel",
+      "confidence": "high",
+      "note": "F.E.A.R.系列游戏中的心灵感应反派，是科学家Harlan Wade的外孙、Alma Wade的儿子。在游戏中宣称'I will be reborn'并控制主角。来源：Tavily Search - https://fear.fandom.com/wiki/Paxton_Fettel"
+    },
+    {
+      "id": 80,
+      "answer": "吴俊霖",
+      "confidence": "high",
+      "note": "伍佰本名吴俊霖，以数字为艺名，演唱会让观众合唱自己指挥，双指遮眼招牌动作。https://zh.wikipedia.org/wiki/伍佰"
+    },
+    {
+      "id": 81,
+      "answer": "20",
+      "confidence": "high",
+      "note": "Victoria Groce在2020年代两次获Jeopardy!锦标赛冠军(2021 Professors Tournament, 2023 Masters)，第二次获胜时是第20位出场选手。来源：Tavily Research - https://en.wikipedia.org/wiki/Jeopardy!_Masters https://www.jeopardy.com/"
+    },
+    {
+      "id": 82,
+      "answer": "1991",
+      "confidence": "high",
+      "note": "已验证：1991年Pinatubo火山喷发导致Clark空军基地废弃。https://en.wikipedia.org/wiki/1991_eruption_of_Mount_Pinatubo"
+    },
+    {
+      "id": 83,
+      "answer": "通用汽车",
+      "confidence": "high",
+      "note": "已验证：GM是UAW 2023罢工核心方，Biden于2023.9.26亲临现场。https://en.wikipedia.org/wiki/General_Motors"
+    },
+    {
+      "id": 84,
+      "answer": "联合国大会",
+      "confidence": "high",
+      "note": "文件编号以A为前缀。https://www.un.org/en/ga/"
+    },
+    {
+      "id": 85,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定电视节目嘉宾宗教；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 86,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定同名者姓名；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 87,
+      "answer": "Lake Prespa",
+      "confidence": "high",
+      "note": "普雷斯帕湖(海拔853m)通过喀斯特地下通道向奥赫里德湖(用于光学导航研究的旅游湖，海拔693m)供水，Prespa海拔更高且鱼类丰富。来源：Tavily Search - https://en.wikipedia.org/wiki/Lake_Prespa https://medium.com/@mapnerdforthewin/discovering-transboundary-lakes-albania-north-macedonia"
+    },
+    {
+      "id": 88,
+      "answer": "2017",
+      "confidence": "high",
+      "note": "已验证：2017年秦大河院士启动冬奥会雪务技术研发，同年启动第二次青藏高原综合科考。https://nieer.cas.cn/xwdt/ttxw/201703/t20170313_4758553.html"
+    },
+    {
+      "id": 89,
+      "answer": "Odaka",
+      "confidence": "high",
+      "note": "尾高型重音（low-high-high-high后接助词时下降）。https://en.wikipedia.org/wiki/Japanese_pitch_accent"
+    },
+    {
+      "id": 90,
+      "answer": "1964",
+      "confidence": "high",
+      "note": "已验证：哥伦比亚FARC于1964年正式成立，由哥伦比亚共产党建立。https://en.wikipedia.org/wiki/Revolutionary_Armed_Forces_of_Colombia"
+    },
+    {
+      "id": 91,
+      "answer": "Equation Group",
+      "confidence": "high",
+      "note": "方程式组织，开发了EternalBlue等漏洞工具，与NSA TAO部门有关。https://www.kaspersky.com/resource-center/threats/equation-group"
+    },
+    {
+      "id": 92,
+      "answer": "Roland Algernon Penrose",
+      "confidence": "high",
+      "note": "Lee Miller(1907-1977)是著名超现实主义摄影师和战地记者，曾为Vogue和Life工作。她的丈夫是Sir Roland Algernon Penrose(1900-1984)，英国艺术家、诗人和策展人。Penrose青年时期在巴黎学习绘画，1922-1936年间游历欧洲，与超现实主义艺术家建立联系。他曾组织1936年伦敦国际超现实主义展览，1947年共同创立英国当代艺术学院(ICA)。来源：https://en.wikipedia.org/wiki/Roland_Penrose https://en.wikipedia.org/wiki/Lee_Miller"
+    },
+    {
+      "id": 93,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需查找WTA锦标赛举办城镇；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 94,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需查找CMU论文作者子女姓名；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 95,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需查找墓碑铭文；Tavily检索未找到权威来源，暂保留Unknown"
+    },
+    {
+      "id": 96,
+      "answer": "2019",
+      "confidence": "medium",
+      "note": "需进一步验证日本连载作品与太平洋岛国会议的具体关联；Tavily检索未找到权威来源，暂保留当前答案"
+    },
+    {
+      "id": 97,
+      "answer": "皇太极",
+      "confidence": "high",
+      "note": "康熙帝执政61年(1661-1722)，尼布楚条约(1689)由索额图签订。康熙的父亲是顺治帝(福临)，但问题问的是顺治的父亲。顺治帝的父亲是清太宗皇太极，其推行时宪历(汤若望所修)。南明割据政权孙可望等在顺治朝有铸币活动。来源：Tavily Search - https://zh.wikipedia.org/wiki/顺治帝 https://zh.wikipedia.org/wiki/汤若望"
+    },
+    {
+      "id": 98,
+      "answer": "Ludovico Sforza",
+      "confidence": "high",
+      "note": "达芬奇的赞助人，米兰公爵。https://en.wikipedia.org/wiki/Ludovico_Sforza"
+    },
+    {
+      "id": 99,
+      "answer": "Unknown",
+      "confidence": "low",
+      "note": "需确定1988-1995年出生的金牛座、效力同一俱乐部7赛季的首位某国英超球员；Tavily检索未找到权威来源，暂保留Unknown"
+    }
+  ]
+}

@@ -43,9 +43,9 @@ references/
 
 # Local config and data
 config.yaml
-*.json
-!question.json
-!mcp_config.json
+
+# Results and outputs (allow JSON to be tracked)
+# answer*.json and console_history are still ignored below
 
 # OS
 .DS_Store
