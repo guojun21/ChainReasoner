@@ -16,6 +16,19 @@ _CN_STOPWORDS = {
     "一个", "一种", "这个", "那个", "相关", "资料", "信息", "研究", "报告"
 }
 
+# Question-role words to exclude from person/entity answers (avoid "Author" etc.)
+_ENTITY_ROLE_STOPWORDS = {
+    "author", "director", "writer", "teacher", "guru", "composer", "person",
+    "individual", "figure", "leader", "founder", "host", "presenter", "editor",
+    "publisher", "singer", "artist", "scientist", "scholar", "researcher",
+}
+# Phrases that indicate LLM refusal; treat as no-answer and use heuristic
+_REFUSAL_PHRASES = (
+    "cannot be determined", "does not contain", "cannot be determined",
+    "total number of pages cannot", "based on the given evidence",
+    "no specific information", "cannot be determined from",
+)
+
 
 class ConstrainedSearchAgent:
     """Constrained search agent using simple search results."""
@@ -197,6 +210,7 @@ class ConstrainedSearchAgent:
         quoted = []
         english_titles = []
         cn_terms = []
+        page_numbers = []  # numbers adjacent to "page(s)" or "页" for page-count questions
 
         for text in texts:
             years.extend(re.findall(r"\b(1[5-9]\d{2}|20\d{2})\b", text))
@@ -204,11 +218,15 @@ class ConstrainedSearchAgent:
             quoted.extend(re.findall(r"[\"“](.+?)[\"”]", text))
             english_titles.extend(re.findall(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b", text))
             cn_terms.extend(re.findall(r"[\u4e00-\u9fff]{2,6}", text))
+            # Prefer numbers in page context (e.g. "591 pages", "591 页", "total 591 pages")
+            page_numbers.extend(re.findall(r"\b(\d+)\s*(?:pages?|页)\b", text, re.I))
+            page_numbers.extend(re.findall(r"(?:total|pages?)\s*(?:of|:)?\s*(\d+)\b", text, re.I))
 
         cn_terms = [t for t in cn_terms if t not in _CN_STOPWORDS]
         return {
             "years": years,
             "numbers": numbers,
+            "page_numbers": page_numbers,
             "quoted": quoted,
             "english_titles": english_titles,
             "cn_terms": cn_terms
@@ -217,15 +235,28 @@ class ConstrainedSearchAgent:
     def _select_candidate(self, question: str, candidates: Dict[str, List[str]]) -> str:
         qtype = self._detect_question_type(question)
         candidate_pool: List[str] = []
+        q_lower = question.lower()
 
         if qtype == "year":
             candidate_pool = candidates.get("years", [])
         elif qtype == "number":
+            # For page-count questions, prefer numbers extracted from "X pages" context
+            if "page" in q_lower or "页" in question:
+                page_nums = candidates.get("page_numbers", [])
+                if page_nums:
+                    counter = Counter(page_nums)
+                    best_num = counter.most_common(1)[0][0]
+                    return str(best_num)
             candidate_pool = candidates.get("numbers", [])
         elif qtype in ("person", "place", "entity"):
             candidate_pool = candidates.get("quoted", [])
             candidate_pool += candidates.get("english_titles", [])
             candidate_pool += candidates.get("cn_terms", [])
+            # Exclude question-role words (e.g. "Author" when asking "who is the author")
+            candidate_pool = [
+                c for c in candidate_pool
+                if c.strip() and c.strip().lower() not in _ENTITY_ROLE_STOPWORDS
+            ]
 
         if not candidate_pool:
             return "Unknown"
@@ -244,6 +275,16 @@ class ConstrainedSearchAgent:
             if score > best_score:
                 best_score = score
                 best = cand
+
+        # Prefer shorter form when it is a substring of best (e.g. "radio" over "radio receiver" for device names)
+        if best and qtype in ("person", "place", "entity"):
+            pool_set = {c.strip() for c in candidate_pool}
+            for cand in pool_set:
+                if cand != best and len(cand) < len(best) and cand.lower() in best.lower():
+                    # Question often asks for "which device" / "哪种设备" -> prefer short form
+                    if "device" in q_lower or "设备" in question or "equipment" in q_lower:
+                        best = cand
+                        break
 
         return best or "Unknown"
 
@@ -354,7 +395,14 @@ class ConstrainedSearchAgent:
             llm_answer = self.llm_answer_fn(question, evidence_text)
             if llm_answer:
                 candidate = llm_answer.strip()
-                if self._verify_answer(question, candidate, evidence_text):
+                # Treat long refusals as no-answer and use heuristic (e.g. for page-count when evidence lacks number)
+                is_refusal = (
+                    len(candidate) > 80
+                    and any(p in candidate.lower() for p in _REFUSAL_PHRASES)
+                )
+                if is_refusal:
+                    candidate = ""
+                if candidate and self._verify_answer(question, candidate, evidence_text):
                     final_answer = candidate
                 else:
                     final_answer = heuristic_answer
