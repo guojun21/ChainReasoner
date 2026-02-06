@@ -3,10 +3,19 @@
 Progressive evaluation with early stopping.
 Stages: 5 -> 20 -> 100 with thresholds 2 and 8.
 Outputs JSON array with id + answer only.
+
+[PERF-OPTIMIZED 2026-02-06] 使用 ThreadPoolExecutor 并发处理题目，大幅提升速度。
+  - 每阶段内的题目并发执行（默认 3 个 worker），受限于 Brave API rate limit
+  - 每题完成立即打印耗时，便于观察
+  - 注意：如果你（Cursor agent）正在修改 api_server.py 或 constrained_search.py，
+    本脚本的并发逻辑不受影响，因为每个线程共享同一个 server 实例。
 """
 
 import json
 import sys
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +30,9 @@ STANDARD_FILE = BASE_DIR / "data" / "qa" / "the_standard_answers.json"
 OUTPUT_DIR = AUTORUN_DIR / "outputs"
 SUMMARY_FILE = OUTPUT_DIR / "last_progressive_summary.json"
 
+# 并发 worker 数（受 Brave API rate limit 约束，不宜过大）
+MAX_WORKERS = 3
+
 
 def _normalize_answer(value):
     if value is None:
@@ -33,7 +45,6 @@ def _normalize_for_compare(value):
     if value is None:
         return ""
     text = " ".join(str(value).strip().split()).lower()
-    # Strip trailing periods and common punctuation
     text = text.rstrip(".")
     return text
 
@@ -84,6 +95,57 @@ def write_summary(summary):
     return SUMMARY_FILE
 
 
+def _answer_one_question(server, q, idx):
+    """处理单个题目，返回 (idx, {"id": ..., "answer": ...}, elapsed_seconds)。"""
+    qid = q.get("id", idx)
+    text = q.get("question", "")
+    t0 = time.time()
+    try:
+        result = server._multi_hop_reasoning(text, use_mcp=True)
+        answer = result.get("answer", "Unknown")
+    except Exception as e:
+        answer = "Unknown"
+        print(f"  [ERROR] Q{qid}: {e}", flush=True)
+    elapsed = time.time() - t0
+    return idx, {"id": qid, "answer": answer}, elapsed
+
+
+# 用于打印的锁，避免多线程输出混乱
+_print_lock = threading.Lock()
+
+
+def _run_stage_concurrent(server, questions, start_idx, end_idx):
+    """并发处理 [start_idx, end_idx) 范围内的题目。返回按原始顺序排列的结果列表。"""
+    batch = [(questions[i], i) for i in range(start_idx, end_idx)]
+    if not batch:
+        return []
+
+    results_dict = {}
+    total = len(batch)
+    done_count = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(_answer_one_question, server, q, idx): idx
+            for q, idx in batch
+        }
+        for future in as_completed(futures):
+            idx, result, elapsed = future.result()
+            results_dict[idx] = result
+            done_count += 1
+            qid = result["id"]
+            ans_preview = result["answer"][:40]
+            with _print_lock:
+                print(
+                    f"  Q{qid} done ({done_count}/{total}) "
+                    f"{elapsed:.1f}s => {ans_preview}",
+                    flush=True,
+                )
+
+    # 按原始索引顺序返回
+    return [results_dict[i] for i in range(start_idx, end_idx)]
+
+
 def main():
     if not QUESTIONS_FILE.exists():
         print(f"Questions file not found: {QUESTIONS_FILE}")
@@ -103,15 +165,15 @@ def main():
 
     for stage_total, threshold in stages:
         target = min(stage_total, len(questions))
-        for idx in range(current_count, target):
-            q = questions[idx]
-            qid = q.get("id", idx)
-            text = q.get("question", "")
-            result = server._multi_hop_reasoning(text, use_mcp=True)
-            answer = result.get("answer", "Unknown")
-            results.append({"id": qid, "answer": answer})
-            if (idx + 1) % 5 == 0:
-                print(f"Progress: {idx + 1}/{target}")
+        if current_count < target:
+            stage_t0 = time.time()
+            print(f"\n=== Stage {stage_total} ({current_count}→{target}) workers={MAX_WORKERS} ===", flush=True)
+
+            stage_results = _run_stage_concurrent(server, questions, current_count, target)
+            results.extend(stage_results)
+
+            stage_elapsed = time.time() - stage_t0
+            print(f"=== Stage {stage_total} done in {stage_elapsed:.1f}s ===", flush=True)
 
         current_count = target
         score = score_results(results, standard_map)

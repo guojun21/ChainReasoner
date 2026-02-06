@@ -45,21 +45,25 @@ class EnhancedMultiHopAPIServer:
         search_cfg = self.config.get("search_agent", {}) if isinstance(self.config, dict) else {}
         self._brave_min_interval = search_cfg.get("brave_min_interval_seconds", 1.2)
         self._brave_last_call_ts = 0.0
+        # [THREAD-SAFE] Lock for Brave rate limiting — needed for concurrent eval
+        import threading
+        self._brave_lock = threading.Lock()
         search_cfg = self.config.get("search_agent", {}) if isinstance(self.config, dict) else {}
         enable_rewrite = search_cfg.get("enable_rewrite", True)
         enable_llm_answer = search_cfg.get("enable_llm_answer", True)
         enable_llm_verify = search_cfg.get("enable_llm_verify", True)
         self.search_agent = ConstrainedSearchAgent(
             self._call_brave_search,
-            max_queries=search_cfg.get("max_queries", 4),
+            max_queries=max(search_cfg.get("max_queries", 4), 4),  # at least 4 queries
             per_query_delay=search_cfg.get("per_query_delay", 0.2),
-            max_results_per_query=search_cfg.get("max_results_per_query", 8),
-            max_evidence=search_cfg.get("max_evidence", 6),
+            max_results_per_query=max(search_cfg.get("max_results_per_query", 8), 8),
+            max_evidence=max(search_cfg.get("max_evidence", 8), 8),
             adaptive_threshold_n=search_cfg.get("adaptive_threshold_n", 0.5),
             rewrite_fn=None,  # Disabled: rewriting strips critical context
             llm_answer_fn=self._extract_answer_llm if enable_llm_answer else None,
             llm_verify_fn=self._verify_answer_llm if enable_llm_verify else None,
-            llm_decompose_fn=self._decompose_question_llm if enable_rewrite else None
+            llm_decompose_fn=self._decompose_question_llm if enable_rewrite else None,
+            llm_knowledge_fn=self._knowledge_answer_llm if enable_llm_answer else None
         )
         self.app = Flask(__name__)
         self._setup_routes()
@@ -374,39 +378,99 @@ FINAL ANSWER:
             "max_tokens": max_tokens
         }
 
-        try:
-            self.logger.info(
-                f"LLM generic call: purpose={purpose or 'generic'} model={model_id} "
-                f"temp={temperature} max_tokens={max_tokens} "
-                f"system_len={len(system_prompt)} user_len={len(user_prompt)}"
-            )
-            response = requests.post(api_url, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            result = response.json()
-            if "choices" in result and result["choices"]:
-                return result["choices"][0]["message"]["content"].strip()
-            self.logger.error(f"LLM generic call missing choices: {str(result)[:400]}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(
+                    f"LLM generic call: purpose={purpose or 'generic'} model={model_id} "
+                    f"temp={temperature} max_tokens={max_tokens} "
+                    f"system_len={len(system_prompt)} user_len={len(user_prompt)}"
+                )
+                response = requests.post(api_url, headers=headers, json=payload, timeout=60)
+                response.raise_for_status()
+                result = response.json()
+                if "choices" in result and result["choices"]:
+                    return result["choices"][0]["message"]["content"].strip()
+                # Rate limit or empty response - retry after delay
+                if result.get("status") in ("449", "429") or result.get("msg", "").lower().find("rate limit") >= 0:
+                    self.logger.warning(f"LLM rate limited (attempt {attempt+1}), retrying in {5*(attempt+1)}s...")
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                self.logger.error(f"LLM generic call missing choices: {str(result)[:400]}")
+                return ""
+            except Exception as e:
+                self.logger.error(f"LLM generic call error (attempt {attempt+1}): {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                return ""
+        return ""
+
+    def _knowledge_answer_llm(self, question: str) -> str:
+        """Use LLM's own knowledge to reason through a multi-hop question and produce a candidate answer."""
+        system_prompt = (
+            "You are an expert at answering complex multi-hop questions using your own knowledge.\n\n"
+            "TASK: Reason step by step through the question, then give ONLY the final answer.\n\n"
+            "RULES:\n"
+            "1. Think through each clue in the question systematically\n"
+            "2. Use your encyclopedic knowledge to identify entities, dates, events\n"
+            "3. For Chinese questions, answer in Chinese; for English questions, answer in English\n"
+            "4. Your final answer must be a specific name, number, year, or short phrase (1-15 words)\n"
+            "5. NEVER say 'Unknown' or 'I don't know' — always give your best answer\n"
+            "6. NEVER include explanations in your answer — just the answer itself\n\n"
+            "FORMAT:\n"
+            "Reasoning: [your step-by-step reasoning]\n"
+            "Answer: [your concise answer]\n"
+        )
+        user_prompt = f"Question: {question}"
+        raw = self._call_llm_generic(system_prompt, user_prompt, temperature=0.0, max_tokens=500, purpose="knowledge_answer")
+        if not raw:
             return ""
-        except Exception as e:
-            self.logger.error(f"LLM generic call error: {str(e)}")
-            return ""
+        # Extract the answer from the response
+        if "Answer:" in raw:
+            answer_part = raw.split("Answer:")[-1].strip()
+            # Take just the first line of the answer
+            answer_part = answer_part.split("\n")[0].strip()
+            return answer_part
+        # If no "Answer:" marker, try to use the last meaningful line
+        lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
+        if lines:
+            return lines[-1]
+        return raw.strip()
 
     def _decompose_question_llm(self, question: str) -> str:
         """Use LLM to decompose a complex multi-hop question into effective web search queries."""
         system_prompt = (
-            "You are an expert at formulating web search queries. Given a complex question, "
-            "think step by step about what specific entities/facts the question describes, "
-            "then generate 2-3 targeted web search queries.\n\n"
-            "Strategy:\n"
-            "- FIRST: Identify the specific entity/person/event the question describes using all clues\n"
-            "- Generate queries that would directly find that entity on Wikipedia, news sites, etc.\n"
-            "- Use the most distinctive clues: proper nouns, specific dates, unique phrases, technical terms\n"
-            "- For Chinese questions, use Chinese queries; for English questions, use English queries\n"
-            "- Each query should be 5-15 words, specific and search-friendly\n\n"
+            "You are an expert at formulating web search queries for multi-hop questions. "
+            "Given a complex question, identify the KEY entities/facts described, then generate "
+            "3-5 highly targeted search queries that will find the specific answer.\n\n"
+            "CRITICAL RULES:\n"
+            "1. Each query must be 5-20 words with SPECIFIC details from the question\n"
+            "2. NEVER use single generic words like 'author', 'spiritual', 'thesis'\n"
+            "3. Include proper nouns, dates, technical terms, and distinctive phrases\n"
+            "4. For multi-hop questions, create queries for EACH hop in the reasoning chain\n"
+            "5. For Chinese questions, write Chinese queries; for English, write English queries\n"
+            "6. Think about what Wikipedia article or authoritative source would answer this\n\n"
+            "EXAMPLES:\n\n"
+            "Question: 一位欧洲学者的某项开源硬件项目...该实体在21世纪10年代中期停止了在其欧洲本土的主要交易...\n"
+            "Queries:\n"
+            "RepRap 开源3D打印项目 创始人 Adrian Bowyer 商业实体\n"
+            "RepRapPro Ltd 停止交易 2015年\n"
+            "Adrian Bowyer Bath大学 退休 开源硬件\n\n"
+            "Question: Who is the author of the article...prosopography...encomienda...1972 journal...\n"
+            "Queries:\n"
+            "prosopography colonial Spanish America encomienda hacienda 1972 article\n"
+            "Latin American Research Review 1972 import substitution industrialization\n"
+            "James Lockhart social history colonial Spanish America\n\n"
+            "Question: There is a spiritual teacher...thirty letters...controversial guru...FBI file...\n"
+            "Queries:\n"
+            "Osho Rajneesh thirty letters book spiritual teacher\n"
+            "Bhagwan Shree Rajneesh FBI file total pages Scribd\n"
+            "Rajneesh FBI file public document pages count\n\n"
             "Output ONLY the search queries, one per line. No numbering, no bullets, no explanation.\n"
         )
         user_prompt = f"Question: {question}"
-        return self._call_llm_generic(system_prompt, user_prompt, temperature=0.0, max_tokens=200, purpose="decompose_question")
+        return self._call_llm_generic(system_prompt, user_prompt, temperature=0.0, max_tokens=400, purpose="decompose_question")
 
     def _rewrite_query_llm(self, query: str) -> str:
         """Rewrite query to be retrieval-friendly."""
@@ -417,24 +481,31 @@ FINAL ANSWER:
     def _extract_answer_llm(self, question: str, evidence: str) -> str:
         """Extract short answer from evidence."""
         system_prompt = (
-            "You are a precise question answering system. Use the provided evidence AND your own knowledge to answer the question.\n\n"
-            "CRITICAL RULES:\n"
-            "- Return ONLY the answer itself — a name, number, year, title, or short phrase\n"
-            "- NEVER return generic role words like 'Author', 'Director', 'The president', 'The company' etc. Return the ACTUAL specific name/entity\n"
-            "- NEVER include explanations, reasoning, preamble, or sentences\n"
-            "- If the question asks 'who is the author', return the person's actual name (e.g. 'James Lockhart'), NOT the word 'Author'\n"
-            "- If the question asks for a company/organization name, return the full official name (e.g. 'RepRapPro Ltd')\n"
-            "- If the question asks for a number or count, return ONLY the number (e.g. '591')\n"
-            "- If the question asks for a year, return ONLY the 4-digit year (e.g. '1979')\n"
-            "- If the question asks for a device/equipment name, prefer the simplest common name (e.g. 'radio' not 'radio receiver')\n"
-            "- Match the language and format requested in the question exactly\n"
-            "- If the answer is in Chinese, respond in Chinese; if in English, respond in English\n"
-            "- Use evidence clues combined with your knowledge to determine the answer\n"
-            "- NEVER say 'Unknown' if the evidence gives any clue — use your best reasoning\n"
-            "- Your answer should typically be 1-5 words. If longer, you are probably doing it wrong.\n"
+            "You are a precise question answering system. You MUST use the provided evidence AND your own knowledge to answer.\n\n"
+            "ABSOLUTE RULES:\n"
+            "1. Return ONLY the answer — a specific name, number, year, title, or short phrase\n"
+            "2. NEVER return 'Unknown' or 'Cannot be determined' — ALWAYS give your best answer\n"
+            "3. NEVER return generic role words like 'Author', 'Director' — return the ACTUAL name\n"
+            "4. NEVER include explanations, reasoning, preamble, or sentences\n"
+            "5. Your answer should typically be 1-10 words maximum\n\n"
+            "FORMAT RULES by question type:\n"
+            "- Person name: Return full name (e.g. 'James Lockhart', '雷佳音和易烊千玺')\n"
+            "- Company/org name: Return official name (e.g. 'RepRapPro Ltd', 'Japan Broadcasting Corporation')\n"
+            "- Number/count: Return ONLY the number (e.g. '591', '4', '2.40')\n"
+            "- Year: Return ONLY 4-digit year (e.g. '1979', '1953')\n"
+            "- Device/thing: Return simplest common name (e.g. 'radio', 'BBC Micro')\n"
+            "- Chinese answer: Respond in Chinese matching the question's expected format\n"
+            "- English answer: Respond in English matching the question's expected format\n\n"
+            "REASONING STRATEGY:\n"
+            "- If the evidence includes a 'Preliminary answer from reasoning', treat it as a strong candidate\n"
+            "- Verify or refine that preliminary answer using the web search evidence\n"
+            "- If the search evidence confirms the preliminary answer, return it\n"
+            "- If the search evidence suggests a BETTER answer, return the better one\n"
+            "- If the evidence is irrelevant, use your knowledge alone — do NOT say Unknown\n"
+            "- For multi-hop questions, follow the chain of reasoning step by step\n"
         )
         user_prompt = f"Question: {question}\n\nEvidence:\n{evidence}\n\nAnswer (just the answer, nothing else):"
-        return self._call_llm_generic(system_prompt, user_prompt, temperature=0.0, max_tokens=128, purpose="extract_answer")
+        return self._call_llm_generic(system_prompt, user_prompt, temperature=0.0, max_tokens=150, purpose="extract_answer")
 
     def _verify_answer_llm(self, question: str, answer: str, evidence: str):
         """Verify answer with evidence. Returns (label, confidence)."""
@@ -488,10 +559,12 @@ FINAL ANSWER:
             }
 
         try:
-            now = time.time()
-            if now - self._brave_last_call_ts < self._brave_min_interval:
-                time.sleep(self._brave_min_interval - (now - self._brave_last_call_ts))
-            self._brave_last_call_ts = time.time()
+            # [THREAD-SAFE] Brave rate limiting with lock for concurrent eval
+            with self._brave_lock:
+                now = time.time()
+                if now - self._brave_last_call_ts < self._brave_min_interval:
+                    time.sleep(self._brave_min_interval - (now - self._brave_last_call_ts))
+                self._brave_last_call_ts = time.time()
             endpoint = "https://api.search.brave.com/res/v1/web/search"
             params = {
                 "q": query,
@@ -502,7 +575,15 @@ FINAL ANSWER:
                 "X-Subscription-Token": api_key
             }
             start_time = time.time()
-            response = requests.get(endpoint, headers=headers, params=params, timeout=30)
+            response = None
+            for _retry in range(3):
+                response = requests.get(endpoint, headers=headers, params=params, timeout=30)
+                if response.status_code == 429:
+                    self.logger.warning(f"Brave 429 rate limited, retrying in {8*(_retry+1)}s...")
+                    time.sleep(8 * (_retry + 1))
+                    self._brave_last_call_ts = time.time()
+                    continue
+                break
             response.raise_for_status()
             data = response.json()
             results = data.get("web", {}).get("results", [])

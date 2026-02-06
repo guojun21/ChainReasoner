@@ -29,6 +29,9 @@ _REFUSAL_PHRASES = (
     "total number of pages cannot", "based on the given evidence",
     "no specific information", "cannot be determined from",
     "not enough information", "insufficient evidence",
+    "i cannot", "i'm unable", "i am unable",
+    "does not provide", "not mentioned", "no evidence",
+    "cannot find", "unable to determine", "not possible to determine",
 )
 
 
@@ -47,7 +50,8 @@ class ConstrainedSearchAgent:
         llm_answer_fn: Optional[Callable[[str, str], str]] = None,
         llm_verify_fn: Optional[Callable[[str, str, str], Tuple[str, float]]] = None,
         llm_summarize_fn: Optional[Callable[[str], str]] = None,
-        llm_decompose_fn: Optional[Callable[[str], str]] = None
+        llm_decompose_fn: Optional[Callable[[str], str]] = None,
+        llm_knowledge_fn: Optional[Callable[[str], str]] = None
     ):
         self.search_fn = search_fn
         self.max_queries = max_queries
@@ -60,6 +64,7 @@ class ConstrainedSearchAgent:
         self.llm_verify_fn = llm_verify_fn
         self.llm_summarize_fn = llm_summarize_fn
         self.llm_decompose_fn = llm_decompose_fn
+        self.llm_knowledge_fn = llm_knowledge_fn
         self._cache: Dict[str, List[Dict[str, Any]]] = {}
 
     def parse_question(self, question: str) -> Dict[str, Any]:
@@ -309,7 +314,7 @@ class ConstrainedSearchAgent:
             if title or content:
                 parts.append(f"[{title}]({url})\n{content}")
         text = "\n\n".join(parts)
-        return text[:6000]
+        return text[:10000]
 
     def _verify_answer(self, question: str, answer: str, evidence_text: str) -> bool:
         if not self.llm_verify_fn:
@@ -319,8 +324,50 @@ class ConstrainedSearchAgent:
             return True
         return False
 
+    def _is_refusal_or_unknown(self, text: str) -> bool:
+        """Check if the answer is a refusal, unknown, or generic role word."""
+        if not text or not text.strip():
+            return True
+        cleaned = text.strip().lower()
+        if cleaned in ("unknown", "n/a", "none", "not found", "no answer"):
+            return True
+        if cleaned in _ENTITY_ROLE_STOPWORDS:
+            return True
+        if cleaned in {"the author", "the director", "the writer",
+            "the founder", "the leader", "the president", "the company",
+            "the organization", "the person", "the individual"}:
+            return True
+        # Check refusal phrases (only for longer answers)
+        if len(cleaned) > 40 and any(p in cleaned for p in _REFUSAL_PHRASES):
+            return True
+        return False
+
+    def _process_llm_answer(self, raw_answer: str) -> str:
+        """Process raw LLM answer: clean, check for refusals, extract core answer."""
+        if not raw_answer:
+            return ""
+        candidate = raw_answer.strip()
+        candidate = self._clean_llm_answer(candidate)
+        if self._is_refusal_or_unknown(candidate):
+            return ""
+        if len(candidate) < 200:
+            return candidate
+        # If LLM gave a long response, take first meaningful line
+        lines = [l.strip() for l in candidate.split("\n") if l.strip()]
+        for line in lines:
+            cleaned_line = self._clean_llm_answer(line)
+            if cleaned_line and not self._is_refusal_or_unknown(cleaned_line) and len(cleaned_line) < 200:
+                return cleaned_line
+        # Last resort: return the first 200 chars if they look like an answer
+        short = candidate[:200].strip()
+        if "\n" in short:
+            short = short.split("\n")[0].strip()
+        if short and not self._is_refusal_or_unknown(short):
+            return short
+        return ""
+
     def answer(self, question: str) -> Dict[str, Any]:
-        """Generate answer using constrained search."""
+        """Generate answer using knowledge-first, search-augmented approach."""
         parsed = self.parse_question(question)
         queries = self.generate_queries(question, parsed)
 
@@ -328,6 +375,19 @@ class ConstrainedSearchAgent:
         reasoning_steps.append(f"Queries: {queries}")
         reasoning_steps.append(f"Query count: {len(queries)}")
 
+        # Phase 0: Knowledge-first — ask LLM to reason using its own knowledge
+        knowledge_answer = ""
+        if self.llm_knowledge_fn:
+            try:
+                raw_knowledge = self.llm_knowledge_fn(question)
+                processed_ka = self._process_llm_answer(raw_knowledge)
+                if processed_ka:
+                    knowledge_answer = processed_ka
+                    reasoning_steps.append(f"Knowledge answer: {knowledge_answer}")
+            except Exception:
+                pass
+
+        # Phase 1: Search for evidence
         all_texts = []
         all_ranked_results = []
         search_traces = []
@@ -345,37 +405,51 @@ class ConstrainedSearchAgent:
         evidence_text = self._build_evidence_text(evidence)
         candidates = self._extract_candidates(all_texts)
         heuristic_answer = self._select_candidate(question, candidates)
-        final_answer = heuristic_answer
 
+        # Phase 2: Search-augmented LLM answer
+        search_answer = ""
         if self.llm_answer_fn and evidence_text:
-            llm_answer = self.llm_answer_fn(question, evidence_text)
-            if llm_answer:
-                candidate = llm_answer.strip()
-                # Remove common LLM preamble patterns
-                candidate = self._clean_llm_answer(candidate)
-                # Treat long refusals as no-answer and use heuristic
-                is_refusal = (
-                    len(candidate) > 60
-                    and any(p in candidate.lower() for p in _REFUSAL_PHRASES)
+            # If we have a knowledge answer, include it as context for the search-augmented pass
+            if knowledge_answer:
+                augmented_evidence = (
+                    f"Preliminary answer from reasoning: {knowledge_answer}\n\n"
+                    f"Web search evidence:\n{evidence_text}"
                 )
-                # Also reject generic role words as answers
-                is_role_word = (
-                    candidate.strip().lower() in _ENTITY_ROLE_STOPWORDS
-                    or candidate.strip().lower() in {"the author", "the director", "the writer",
-                        "the founder", "the leader", "the president", "the company",
-                        "the organization", "the person", "the individual"}
-                )
-                if is_refusal or is_role_word:
-                    candidate = ""
-                if candidate and len(candidate) < 500:
-                    final_answer = candidate
-                elif candidate:
-                    # If LLM gave a long response, take first meaningful line
-                    lines = [l.strip() for l in candidate.split("\n") if l.strip()]
-                    if lines:
-                        final_answer = lines[0]
+            else:
+                augmented_evidence = evidence_text
+
+            llm_answer = self.llm_answer_fn(question, augmented_evidence[:12000])
+            processed = self._process_llm_answer(llm_answer)
+            if processed:
+                search_answer = processed
+
+        # If search-augmented pass failed, try extended evidence pass
+        if not search_answer and self.llm_answer_fn:
+            title_summary = "\n".join(
+                f"- {item.get('title', '')}: {item.get('content', '')[:200]}"
+                for item in all_ranked_results[:15]
+                if item.get("title")
+            )
+            extended = f"{evidence_text}\n\nAdditional search results:\n{title_summary}"
+            if knowledge_answer:
+                extended = f"Preliminary answer from reasoning: {knowledge_answer}\n\n{extended}"
+            llm_answer2 = self.llm_answer_fn(question, extended[:12000])
+            processed2 = self._process_llm_answer(llm_answer2)
+            if processed2:
+                search_answer = processed2
+
+        # Phase 3: Select best answer — prefer search-augmented > knowledge > heuristic
+        final_answer = "Unknown"
+        if search_answer and not self._is_refusal_or_unknown(search_answer):
+            final_answer = search_answer
+        elif knowledge_answer and not self._is_refusal_or_unknown(knowledge_answer):
+            final_answer = knowledge_answer
+        elif heuristic_answer and not self._is_refusal_or_unknown(heuristic_answer):
+            final_answer = heuristic_answer
 
         reasoning_steps.append(f"Evidence count: {len(evidence)}")
+        reasoning_steps.append(f"Knowledge answer: {knowledge_answer}")
+        reasoning_steps.append(f"Search answer: {search_answer}")
         reasoning_steps.append(f"Final answer: {final_answer}")
 
         return {
