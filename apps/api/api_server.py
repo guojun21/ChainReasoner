@@ -43,7 +43,7 @@ class EnhancedMultiHopAPIServer:
         self.api_token = self.config.get("api_token", "default_token_123456")
         self.mcp_config = self._load_mcp_config()
         search_cfg = self.config.get("search_agent", {}) if isinstance(self.config, dict) else {}
-        self._brave_min_interval = search_cfg.get("brave_min_interval_seconds", 1.2)
+        self._brave_min_interval = max(search_cfg.get("brave_min_interval_seconds", 1.2), 1.5)
         self._brave_last_call_ts = 0.0
         # [THREAD-SAFE] Lock for Brave rate limiting — needed for concurrent eval
         import threading
@@ -54,7 +54,7 @@ class EnhancedMultiHopAPIServer:
         enable_llm_verify = search_cfg.get("enable_llm_verify", True)
         self.search_agent = ConstrainedSearchAgent(
             self._call_brave_search,
-            max_queries=max(search_cfg.get("max_queries", 4), 4),  # at least 4 queries
+            max_queries=max(search_cfg.get("max_queries", 3), 3),  # 3 queries for hop-1, saving budget for hop-2
             per_query_delay=search_cfg.get("per_query_delay", 0.2),
             max_results_per_query=max(search_cfg.get("max_results_per_query", 8), 8),
             max_evidence=max(search_cfg.get("max_evidence", 8), 8),
@@ -417,9 +417,7 @@ FINAL ANSWER:
             "3. For Chinese questions, answer in Chinese; for English questions, answer in English\n"
             "4. Your final answer must be a specific name, number, year, or short phrase (1-15 words)\n"
             "5. NEVER say 'Unknown' or 'I don't know' — always give your best answer\n"
-            "6. NEVER include explanations in your answer — just the answer itself\n"
-            "7. Match the question's requested format EXACTLY (e.g., '直接回答数字' means return only a number)\n"
-            "8. Be as CONCISE as possible — if the answer is a single word, return just that word\n\n"
+            "6. NEVER include explanations in your answer — just the answer itself\n\n"
             "FORMAT:\n"
             "Reasoning: [your step-by-step reasoning]\n"
             "Answer: [your concise answer]\n"
@@ -448,39 +446,27 @@ FINAL ANSWER:
             "3-5 highly targeted search queries that will find the specific answer.\n\n"
             "CRITICAL RULES:\n"
             "1. Each query must be 5-20 words with SPECIFIC details from the question\n"
-            "2. NEVER use single generic words like 'author', 'spiritual', 'thesis', 'director'\n"
-            "3. NEVER output queries shorter than 4 words\n"
-            "4. Include proper nouns, dates, technical terms, and distinctive phrases from the question\n"
-            "5. For multi-hop questions, create queries for EACH hop in the reasoning chain\n"
-            "6. For Chinese questions, write Chinese queries; for English, write English queries\n"
-            "7. Think about what Wikipedia article or authoritative source would answer this\n"
-            "8. Use quotation marks around exact phrases when helpful\n\n"
+            "2. NEVER use single generic words like 'author', 'spiritual', 'thesis'\n"
+            "3. Include proper nouns, dates, technical terms, and distinctive phrases\n"
+            "4. For multi-hop questions, create queries for EACH hop in the reasoning chain\n"
+            "5. For Chinese questions, write Chinese queries; for English, write English queries\n"
+            "6. Think about what Wikipedia article or authoritative source would answer this\n\n"
             "EXAMPLES:\n\n"
             "Question: 一位欧洲学者的某项开源硬件项目...该实体在21世纪10年代中期停止了在其欧洲本土的主要交易...\n"
             "Queries:\n"
-            "RepRap 开源3D打印项目 创始人 商业实体\n"
-            "RepRapPro Ltd 停止交易 2015年 欧洲\n"
+            "RepRap 开源3D打印项目 创始人 Adrian Bowyer 商业实体\n"
+            "RepRapPro Ltd 停止交易 2015年\n"
             "Adrian Bowyer Bath大学 退休 开源硬件\n\n"
             "Question: Who is the author of the article...prosopography...encomienda...1972 journal...\n"
             "Queries:\n"
-            "prosopography colonial Spanish America encomienda hacienda 1972\n"
-            "Latin American Research Review 1972 volume 7 social history\n"
-            "colonial Spanish America social history 1972 journal article author\n\n"
+            "prosopography colonial Spanish America encomienda hacienda 1972 article\n"
+            "Latin American Research Review 1972 import substitution industrialization\n"
+            "James Lockhart social history colonial Spanish America\n\n"
             "Question: There is a spiritual teacher...thirty letters...controversial guru...FBI file...\n"
             "Queries:\n"
-            "Bhagwan Shree Rajneesh thirty letters book spiritual teacher\n"
+            "Osho Rajneesh thirty letters book spiritual teacher\n"
             "Bhagwan Shree Rajneesh FBI file total pages Scribd\n"
-            "Rajneesh FBI file public document sharing platform pages\n\n"
-            "Question: There's a thesis submitted between 2020 and 2023...Doctor of Philosophy...dating apps...podcast\n"
-            "Queries:\n"
-            "PhD thesis dating apps 2020 2021 2022 2023 podcast acknowledgment\n"
-            "doctoral thesis dating apps dedicated children relationship ended podcast\n"
-            "dating apps PhD dissertation podcast film event\n\n"
-            "Question: 在一座作为某国国家客运铁路公司总部的某国东海岸城市...\n"
-            "Queries:\n"
-            "Amtrak总部 东海岸城市 交通枢纽 20世纪初\n"
-            "Union Station Washington DC 完工年份 1907\n"
-            "华盛顿 交通枢纽 音乐会 艺术博物馆\n\n"
+            "Rajneesh FBI file public document pages count\n\n"
             "Output ONLY the search queries, one per line. No numbering, no bullets, no explanation.\n"
         )
         user_prompt = f"Question: {question}"
@@ -497,27 +483,19 @@ FINAL ANSWER:
         system_prompt = (
             "You are a precise question answering system. You MUST use the provided evidence AND your own knowledge to answer.\n\n"
             "ABSOLUTE RULES:\n"
-            "1. Return ONLY the final answer — a specific name, number, year, title, or short phrase\n"
+            "1. Return ONLY the answer — a specific name, number, year, title, or short phrase\n"
             "2. NEVER return 'Unknown' or 'Cannot be determined' — ALWAYS give your best answer\n"
             "3. NEVER return generic role words like 'Author', 'Director' — return the ACTUAL name\n"
             "4. NEVER include explanations, reasoning, preamble, or sentences\n"
-            "5. Your answer should typically be 1-10 words maximum\n"
-            "6. Do NOT add extra descriptive words — be as concise as the question requires\n\n"
+            "5. Your answer should typically be 1-10 words maximum\n\n"
             "FORMAT RULES by question type:\n"
             "- Person name: Return full name (e.g. 'James Lockhart', '雷佳音和易烊千玺')\n"
-            "- Company/org name: Return official name exactly (e.g. 'RepRapPro Ltd', 'Japan Broadcasting Corporation')\n"
+            "- Company/org name: Return official name (e.g. 'RepRapPro Ltd', 'Japan Broadcasting Corporation')\n"
             "- Number/count: Return ONLY the number (e.g. '591', '4', '2.40')\n"
             "- Year: Return ONLY 4-digit year (e.g. '1979', '1953')\n"
-            "- Device/thing: Return the SIMPLEST common name — e.g. 'radio' NOT 'radio receiver', 'BBC Micro' NOT 'BBC Microcomputer'\n"
+            "- Device/thing: Return simplest common name (e.g. 'radio', 'BBC Micro')\n"
             "- Chinese answer: Respond in Chinese matching the question's expected format\n"
             "- English answer: Respond in English matching the question's expected format\n\n"
-            "CRITICAL — Match the requested format EXACTLY:\n"
-            "- If question says '直接回答数字' — return ONLY a number like '1953'\n"
-            "- If question says 'Answer with Arabic numerals' — return ONLY a number like '1979'\n"
-            "- If question says 'first name and last name only' — return ONLY the name like 'Ronald Reagan'\n"
-            "- If question says 'english name' — return ONLY the English name\n"
-            "- If question asks for '英文名称' or '英文简称' — return ONLY the English name/abbreviation\n"
-            "- If question asks for '中文全称' or '中文名称' — return ONLY the Chinese name\n\n"
             "REASONING STRATEGY:\n"
             "- If the evidence includes a 'Preliminary answer from reasoning', treat it as a strong candidate\n"
             "- Verify or refine that preliminary answer using the web search evidence\n"
@@ -598,12 +576,15 @@ FINAL ANSWER:
             }
             start_time = time.time()
             response = None
-            for _retry in range(3):
+            for _retry in range(4):
                 response = requests.get(endpoint, headers=headers, params=params, timeout=30)
                 if response.status_code == 429:
-                    self.logger.warning(f"Brave 429 rate limited, retrying in {8*(_retry+1)}s...")
-                    time.sleep(8 * (_retry + 1))
-                    self._brave_last_call_ts = time.time()
+                    # Aggressive exponential backoff: 15, 30, 60, 120 seconds
+                    wait_time = 15 * (2 ** _retry)
+                    self.logger.warning(f"Brave 429 rate limited, retrying in {wait_time}s (attempt {_retry+1}/4)...")
+                    time.sleep(wait_time)
+                    with self._brave_lock:
+                        self._brave_last_call_ts = time.time()
                     continue
                 break
             response.raise_for_status()

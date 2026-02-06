@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """
-Progressive evaluation with early stopping.
+Progressive evaluation with early stopping and regression detection.
 Stages: 5 -> 20 -> 100 with thresholds 2 and 8.
 Outputs JSON array with id + answer only.
+
+== 只进不退机制 ==
+评测前自动加载历史最佳答案（outputs/ 里分数最高的文件）作为 baseline。
+每完成一道题，如果该题在 baseline 中答对了但本轮答错了，立即终止评测并报告退步原因。
+这确保代码修改不会导致以前答对的题突然答错（退步）。
 
 [PERF-OPTIMIZED 2026-02-06] 使用 ThreadPoolExecutor 并发处理题目，大幅提升速度。
   - 每阶段内的题目并发执行（默认 3 个 worker），受限于 Brave API rate limit
   - 每题完成立即打印耗时，便于观察
   - 注意：如果你（Cursor agent）正在修改 api_server.py 或 constrained_search.py，
     本脚本的并发逻辑不受影响，因为每个线程共享同一个 server 实例。
+
+== 禁止修改评分逻辑 ==
+_normalize_for_compare() 和 score_results() 是评分核心函数，
+禁止添加缩写归一化、包含关系匹配、模糊匹配等放松评分标准的逻辑。
+最终比赛用比赛方的评分系统，不是本地的。
 """
 
 import json
+import re
 import sys
 import time
 import threading
@@ -41,7 +52,9 @@ def _normalize_answer(value):
 
 
 def _normalize_for_compare(value):
-    """Normalize answer for comparison: lowercase and strip punctuation."""
+    """Normalize answer for comparison: lowercase and strip punctuation.
+    禁止修改此函数！不得添加缩写归一化、包含匹配等放松评分的逻辑。
+    """
     if value is None:
         return ""
     text = " ".join(str(value).strip().split()).lower()
@@ -67,6 +80,7 @@ def load_standard_map(file_path: Path):
 
 
 def score_results(results, standard_map):
+    """禁止修改此函数！评分必须保持精确文本匹配。"""
     matches = 0
     for item in results:
         qid = str(item.get("id"))
@@ -77,6 +91,74 @@ def score_results(results, standard_map):
         if our == ref:
             matches += 1
     return matches
+
+
+# --------------- 只进不退：历史最佳 baseline ---------------
+
+def _load_best_baseline(standard_map):
+    """扫描 outputs/ 目录，找到分数最高的答案文件，返回其中答对的题目集合。
+    返回: (baseline_correct_ids: set, baseline_file: str, baseline_score: int)
+    """
+    if not OUTPUT_DIR.exists():
+        return set(), "", 0
+
+    best_score = -1
+    best_file = None
+
+    for f in OUTPUT_DIR.iterdir():
+        m = re.match(r"(\d+)分_\d+_answers\.json$", f.name)
+        if m:
+            file_score = int(m.group(1))
+            if file_score > best_score:
+                best_score = file_score
+                best_file = f
+
+    if not best_file or best_score <= 0:
+        return set(), "", 0
+
+    try:
+        with open(best_file, "r", encoding="utf-8") as fh:
+            baseline_results = json.load(fh)
+    except Exception:
+        return set(), "", 0
+
+    correct_ids = set()
+    for item in baseline_results:
+        qid = str(item.get("id"))
+        if qid not in standard_map:
+            continue
+        our = _normalize_for_compare(item.get("answer"))
+        ref = _normalize_for_compare(standard_map[qid])
+        if our == ref:
+            correct_ids.add(qid)
+
+    return correct_ids, str(best_file), best_score
+
+
+def _check_regression(results, standard_map, baseline_correct_ids):
+    """检查本轮结果是否有退步（baseline 答对但本轮答错的题）。
+    返回: list of {qid, baseline_answer(correct), current_answer, standard_answer}
+    """
+    regressions = []
+    for item in results:
+        qid = str(item.get("id"))
+        if qid not in baseline_correct_ids:
+            continue  # baseline 也没答对，不算退步
+        if qid not in standard_map:
+            continue
+        our = _normalize_for_compare(item.get("answer"))
+        ref = _normalize_for_compare(standard_map[qid])
+        if our != ref:
+            regressions.append({
+                "qid": qid,
+                "current_answer": item.get("answer"),
+                "standard_answer": standard_map[qid],
+                "note": f"Q{qid} 退步！baseline 答对了，本轮答错"
+            })
+    return regressions
+
+
+# --------------- /只进不退 ---------------
 
 
 def save_results(results, score):
@@ -158,6 +240,15 @@ def main():
     standard_map = load_standard_map(STANDARD_FILE)
     server = EnhancedMultiHopAPIServer()
 
+    # 加载历史最佳 baseline
+    baseline_correct_ids, baseline_file, baseline_score = _load_best_baseline(standard_map)
+    if baseline_correct_ids:
+        print(f"\n[Baseline] 历史最佳: {baseline_score}分 ({baseline_file})", flush=True)
+        print(f"[Baseline] 答对的题目 ({len(baseline_correct_ids)}题): {sorted(baseline_correct_ids, key=lambda x: int(x))}", flush=True)
+        print(f"[Baseline] 本轮如果这些题答错，将立即终止评测\n", flush=True)
+    else:
+        print("\n[Baseline] 无历史最佳记录，跳过退步检测\n", flush=True)
+
     stages = [(5, 2), (20, 8), (100, None)]
     results = []
     current_count = 0
@@ -177,6 +268,53 @@ def main():
 
         current_count = target
         score = score_results(results, standard_map)
+
+        # ---- 只进不退：检查退步 ----
+        if baseline_correct_ids:
+            regressions = _check_regression(results, standard_map, baseline_correct_ids)
+            if regressions:
+                # 还是先保存结果，方便分析
+                last_output = save_results(results, score)
+
+                print(f"\n{'='*60}", flush=True)
+                print(f"🚨 退步检测失败！本轮得 {score} 分，但有 {len(regressions)} 道题退步了", flush=True)
+                print(f"   Baseline: {baseline_score}分 ({baseline_file})", flush=True)
+                print(f"{'='*60}", flush=True)
+                for reg in regressions:
+                    print(f"  ❌ Q{reg['qid']}: baseline 答对 \"{reg['standard_answer']}\"", flush=True)
+                    print(f"     本轮答了 \"{reg['current_answer']}\" — 退步！", flush=True)
+                print(f"{'='*60}", flush=True)
+                print(f"\n结论：代码修改导致退步，必须回滚或修复以上退步的题目。", flush=True)
+                print(f"本轮新答对但 baseline 没对的题不能以牺牲已对的题为代价。\n", flush=True)
+
+                # 写 summary 标记失败和退步原因
+                regression_detail = [
+                    f"Q{r['qid']}: baseline正确=\"{r['standard_answer']}\" 本轮错误=\"{r['current_answer']}\""
+                    for r in regressions
+                ]
+                summary = {
+                    "stage_total": stage_total,
+                    "ran": current_count,
+                    "score": score,
+                    "threshold": threshold,
+                    "passed": False,
+                    "output_file": str(last_output),
+                    "regression_detected": True,
+                    "regression_count": len(regressions),
+                    "regression_detail": regression_detail,
+                    "baseline_score": baseline_score,
+                    "baseline_file": baseline_file,
+                    "failure_reason": f"退步{len(regressions)}题: " + "; ".join(
+                        f"Q{r['qid']}(\"{r['standard_answer']}\"→\"{r['current_answer']}\")"
+                        for r in regressions
+                    )
+                }
+                write_summary(summary)
+                print(f"Output: {last_output}")
+                print(f"Summary: {SUMMARY_FILE}")
+                return  # 立即终止
+        # ---- /只进不退 ----
+
         last_output = save_results(results, score)
 
         summary = {

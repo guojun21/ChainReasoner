@@ -3,6 +3,8 @@
 Constrained Search Agent
 Implements a search-only pipeline with heuristic reasoning.
 Uses LLM-based query decomposition for multi-hop questions.
+Features iterative 2-hop search: first search finds intermediate entities,
+second search uses those entities to find the final answer.
 """
 
 import re
@@ -36,7 +38,7 @@ _REFUSAL_PHRASES = (
 
 
 class ConstrainedSearchAgent:
-    """Constrained search agent using simple search results."""
+    """Constrained search agent using simple search results with iterative multi-hop search."""
 
     def __init__(
         self,
@@ -100,12 +102,8 @@ class ConstrainedSearchAgent:
                         # Remove numbered prefixes like "1.", "1)", "- "
                         line = re.sub(r"^\d+[\.\)]\s*", "", line)
                         line = re.sub(r"^[-\u2022]\s*", "", line)
-                        # Remove labels like "Queries:", "Search:", etc.
-                        line = re.sub(r"^(?:Queries?|Search|Query)\s*:\s*", "", line, flags=re.IGNORECASE)
                         line = line.strip().strip('"').strip("'")
-                        # Require at least 8 chars AND at least 2 words to avoid garbage generic queries
-                        word_count = len(line.split())
-                        if line and len(line) >= 8 and word_count >= 2:
+                        if line and len(line) >= 4:
                             queries.append(line)
             except Exception:
                 pass
@@ -151,7 +149,6 @@ class ConstrainedSearchAgent:
         if query in self._cache:
             return self._cache[query], query
         # Skip rewrite for LLM-decomposed queries - they are already optimized
-        # Rewriting was stripping context and making queries too generic
         rewritten = query
         try:
             result = self.search_fn(rewritten, {"original_query": query, "rewritten_query": rewritten})
@@ -255,13 +252,6 @@ class ConstrainedSearchAgent:
             r"^based\s+on\s+the\s+(?:evidence|information|search\s+results)[,:]?\s*",
             r"^according\s+to\s+the\s+(?:evidence|sources?)[,:]?\s*",
             r"^from\s+the\s+evidence[,:]?\s*",
-            r"^therefore[,:]?\s*",
-            r"^thus[,:]?\s*",
-            r"^so[,:]?\s*",
-            r"^in\s+conclusion[,:]?\s*",
-            r"^the\s+name\s+(?:of\s+)?(?:the\s+)?(?:\w+\s+)?is\s*:?\s*",
-            r"^(?:it\s+is|it\'s)\s+",
-            r"^this\s+(?:is|was)\s+",
         ]
         cleaned = answer
         for prefix in prefixes:
@@ -273,8 +263,6 @@ class ConstrainedSearchAgent:
         if len(cleaned) >= 2:
             if (cleaned[0] in '"\'«\u201c\u300c' and cleaned[-1] in '"\'»\u201d\u300d'):
                 cleaned = cleaned[1:-1].strip()
-        # Remove markdown bold markers
-        cleaned = re.sub(r'\*\*(.+?)\*\*', r'\1', cleaned).strip()
         return cleaned
 
     def _tokenize_terms(self, query: str) -> List[str]:
@@ -284,6 +272,7 @@ class ConstrainedSearchAgent:
     def _score_result(self, query: str, result: Dict[str, Any]) -> float:
         title = (result.get("title") or "").lower()
         content = (result.get("content") or "").lower()
+        url = (result.get("url") or "").lower()
         terms = self._tokenize_terms(query)
         if not terms:
             return 0.0
@@ -292,6 +281,11 @@ class ConstrainedSearchAgent:
         score = title_hits * 2.0 + content_hits * 1.0
         if len(content) < 50:
             score -= 0.5
+        # Boost Wikipedia and other authoritative sources
+        if "wikipedia.org" in url:
+            score += 3.0
+        elif any(d in url for d in ["britannica.com", "baidu.com/baike", "zhihu.com", "ncbi.nlm.nih.gov"]):
+            score += 1.5
         return score
 
     def _rank_and_filter(self, query: str, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -379,60 +373,58 @@ class ConstrainedSearchAgent:
             return short
         return ""
 
-    def _format_final_answer(self, question: str, answer: str) -> str:
-        """Post-process the final answer to match expected output format based on question hints."""
-        if not answer or answer == "Unknown":
-            return answer
+    def _do_search_round(self, queries: List[str]) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Execute a round of searches. Returns (all_texts, all_ranked_results, search_traces)."""
+        all_texts = []
+        all_ranked_results = []
+        search_traces = []
+        for q in queries:
+            results, rewritten = self._search(q)
+            ranked = self._rank_and_filter(rewritten, results)
+            search_traces.append({"query": q, "rewritten": rewritten, "count": len(ranked)})
+            all_ranked_results.extend(ranked)
+            for item in ranked:
+                title = item.get("title", "")
+                content = item.get("content", "")
+                all_texts.append(f"{title} {content}")
+        return all_texts, all_ranked_results, search_traces
 
-        q_lower = question.lower()
-
-        # For year-only questions: extract just the 4-digit year
-        if any(k in question for k in ["直接回答数字", "Answer with Arabic numerals", "Answer with the four-digit year"]):
-            nums = re.findall(r'\b(1[5-9]\d{2}|20\d{2})\b', answer)
-            if nums:
-                return nums[0]
-            # Try to extract any number
-            nums = re.findall(r'\b(\d+)\b', answer)
-            if nums:
-                return nums[0]
-
-        # For number-only questions: extract just the number
-        if "answer with arabic numeral" in q_lower or "provide your answer as a numerical digit" in q_lower:
-            nums = re.findall(r'\b(\d+(?:\.\d+)?)\b', answer)
-            if nums:
-                return nums[0]
-
-        # For "Answer with the person's first name and last name only" questions
-        if "first name and last name only" in q_lower or "first and last" in q_lower:
-            # Remove titles and qualifiers
-            cleaned = re.sub(r'^(?:Sir|Dr|Prof|Mr|Mrs|Ms|Lord|Lady|Baron|Count|Duke)\s+', '', answer, flags=re.IGNORECASE).strip()
-            # Remove anything after a comma or parenthesis
-            cleaned = re.split(r'[,(]', cleaned)[0].strip()
-            if cleaned:
-                return cleaned
-
-        # For English name questions
-        if "please answer with english name" in q_lower:
-            # Remove non-English characters and keep only the English part
-            english_parts = re.findall(r'[A-Za-z][A-Za-z\s\-]+', answer)
-            if english_parts:
-                best = max(english_parts, key=len).strip()
-                if best:
-                    return best
-
-        # For "Answer with the central figure's name written in French"
-        if "written in french" in q_lower:
-            # Keep the answer as-is if it looks like French (has accents)
-            pass
-
-        # Remove trailing period for short answers
-        if len(answer) < 100 and answer.endswith('.'):
-            answer = answer[:-1].strip()
-
-        return answer
+    def _generate_hop2_queries(self, question: str, hop1_answer: str, evidence_text: str) -> List[str]:
+        """Generate second-hop search queries using the intermediate answer from hop 1.
+        
+        This implements the core multi-hop strategy: use the first-round answer
+        as a new search term to find the final answer.
+        """
+        if not self.llm_decompose_fn or not hop1_answer:
+            return []
+        
+        # Ask LLM to generate follow-up queries using the intermediate answer
+        hop2_prompt = (
+            f"Based on a first round of research, we found this intermediate answer: \"{hop1_answer}\"\n\n"
+            f"Original question: {question}\n\n"
+            f"Generate 1-2 SPECIFIC follow-up search queries that use the intermediate answer "
+            f"to find the FINAL answer to the original question. "
+            f"Include the key entity/name from the intermediate answer in each query.\n"
+            f"Output ONLY the search queries, one per line."
+        )
+        try:
+            raw = self.llm_decompose_fn(hop2_prompt)
+            if not raw:
+                return []
+            queries = []
+            for line in raw.strip().split("\n"):
+                line = line.strip()
+                line = re.sub(r"^\d+[\.\)]\s*", "", line)
+                line = re.sub(r"^[-\u2022]\s*", "", line)
+                line = line.strip().strip('"').strip("'")
+                if line and len(line) >= 4:
+                    queries.append(line)
+            return queries[:2]  # Limit to 2 to save API calls
+        except Exception:
+            return []
 
     def answer(self, question: str) -> Dict[str, Any]:
-        """Generate answer using knowledge-first, search-augmented approach."""
+        """Generate answer using knowledge-first, iterative multi-hop search approach."""
         parsed = self.parse_question(question)
         queries = self.generate_queries(question, parsed)
 
@@ -452,29 +444,18 @@ class ConstrainedSearchAgent:
             except Exception:
                 pass
 
-        # Phase 1: Search for evidence
-        all_texts = []
-        all_ranked_results = []
-        search_traces = []
-        for q in queries:
-            results, rewritten = self._search(q)
-            ranked = self._rank_and_filter(rewritten, results)
-            search_traces.append({"query": q, "rewritten": rewritten, "count": len(ranked)})
-            all_ranked_results.extend(ranked)
-            for item in ranked:
-                title = item.get("title", "")
-                content = item.get("content", "")
-                all_texts.append(f"{title} {content}")
+        # Phase 1: First search round (hop 1)
+        all_texts, all_ranked_results, search_traces = self._do_search_round(queries)
 
         evidence = self._select_evidence(all_ranked_results)
         evidence_text = self._build_evidence_text(evidence)
         candidates = self._extract_candidates(all_texts)
         heuristic_answer = self._select_candidate(question, candidates)
 
-        # Phase 2: Search-augmented LLM answer
+        # Phase 2: Search-augmented LLM answer (hop 1)
         search_answer = ""
         if self.llm_answer_fn and evidence_text:
-            # If we have a knowledge answer, include it as context for the search-augmented pass
+            # If we have a knowledge answer, include it as context
             if knowledge_answer:
                 augmented_evidence = (
                     f"Preliminary answer from reasoning: {knowledge_answer}\n\n"
@@ -503,6 +484,32 @@ class ConstrainedSearchAgent:
             if processed2:
                 search_answer = processed2
 
+        # Phase 2.5: Iterative hop-2 search
+        # If we got an intermediate answer, use it to do a second round of targeted search
+        hop1_answer = search_answer or knowledge_answer
+        if hop1_answer and not self._is_refusal_or_unknown(hop1_answer) and self.llm_decompose_fn:
+            hop2_queries = self._generate_hop2_queries(question, hop1_answer, evidence_text)
+            if hop2_queries:
+                reasoning_steps.append(f"Hop-2 queries: {hop2_queries}")
+                hop2_texts, hop2_ranked, hop2_traces = self._do_search_round(hop2_queries)
+                search_traces.extend(hop2_traces)
+
+                # Combine hop1 and hop2 evidence
+                combined_results = all_ranked_results + hop2_ranked
+                combined_evidence = self._select_evidence(combined_results)
+                combined_evidence_text = self._build_evidence_text(combined_evidence)
+
+                if combined_evidence_text and self.llm_answer_fn:
+                    hop2_augmented = (
+                        f"Preliminary answer from first round: {hop1_answer}\n\n"
+                        f"Combined evidence from two search rounds:\n{combined_evidence_text}"
+                    )
+                    hop2_llm_answer = self.llm_answer_fn(question, hop2_augmented[:12000])
+                    hop2_processed = self._process_llm_answer(hop2_llm_answer)
+                    if hop2_processed and not self._is_refusal_or_unknown(hop2_processed):
+                        search_answer = hop2_processed
+                        reasoning_steps.append(f"Hop-2 refined answer: {search_answer}")
+
         # Phase 3: Select best answer — prefer search-augmented > knowledge > heuristic
         final_answer = "Unknown"
         if search_answer and not self._is_refusal_or_unknown(search_answer):
@@ -511,9 +518,6 @@ class ConstrainedSearchAgent:
             final_answer = knowledge_answer
         elif heuristic_answer and not self._is_refusal_or_unknown(heuristic_answer):
             final_answer = heuristic_answer
-
-        # Phase 4: Format-aware post-processing
-        final_answer = self._format_final_answer(question, final_answer)
 
         reasoning_steps.append(f"Evidence count: {len(evidence)}")
         reasoning_steps.append(f"Knowledge answer: {knowledge_answer}")
