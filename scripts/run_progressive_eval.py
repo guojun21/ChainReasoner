@@ -28,6 +28,16 @@ def _normalize_answer(value):
     return " ".join(str(value).strip().split())
 
 
+def _normalize_for_compare(value):
+    """Normalize answer for comparison: lowercase and strip punctuation."""
+    if value is None:
+        return ""
+    text = " ".join(str(value).strip().split()).lower()
+    # Strip trailing periods and common punctuation
+    text = text.rstrip(".")
+    return text
+
+
 def load_questions(file_path: Path):
     questions = []
     with open(file_path, "r", encoding="utf-8") as f:
@@ -49,7 +59,11 @@ def score_results(results, standard_map):
     matches = 0
     for item in results:
         qid = str(item.get("id"))
-        if qid in standard_map and _normalize_answer(item.get("answer")) == standard_map[qid]:
+        if qid not in standard_map:
+            continue
+        our = _normalize_for_compare(item.get("answer"))
+        ref = _normalize_for_compare(standard_map[qid])
+        if our == ref:
             matches += 1
     return matches
 

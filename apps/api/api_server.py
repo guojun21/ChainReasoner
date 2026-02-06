@@ -56,9 +56,10 @@ class EnhancedMultiHopAPIServer:
             max_results_per_query=search_cfg.get("max_results_per_query", 8),
             max_evidence=search_cfg.get("max_evidence", 6),
             adaptive_threshold_n=search_cfg.get("adaptive_threshold_n", 0.5),
-            rewrite_fn=self._rewrite_query_llm if enable_rewrite else None,
+            rewrite_fn=None,  # Disabled: rewriting strips critical context
             llm_answer_fn=self._extract_answer_llm if enable_llm_answer else None,
-            llm_verify_fn=self._verify_answer_llm if enable_llm_verify else None
+            llm_verify_fn=self._verify_answer_llm if enable_llm_verify else None,
+            llm_decompose_fn=self._decompose_question_llm if enable_rewrite else None
         )
         self.app = Flask(__name__)
         self._setup_routes()
@@ -390,6 +391,23 @@ FINAL ANSWER:
             self.logger.error(f"LLM generic call error: {str(e)}")
             return ""
 
+    def _decompose_question_llm(self, question: str) -> str:
+        """Use LLM to decompose a complex multi-hop question into effective web search queries."""
+        system_prompt = (
+            "You are an expert at formulating web search queries. Given a complex question, "
+            "think step by step about what specific entities/facts the question describes, "
+            "then generate 2-3 targeted web search queries.\n\n"
+            "Strategy:\n"
+            "- FIRST: Identify the specific entity/person/event the question describes using all clues\n"
+            "- Generate queries that would directly find that entity on Wikipedia, news sites, etc.\n"
+            "- Use the most distinctive clues: proper nouns, specific dates, unique phrases, technical terms\n"
+            "- For Chinese questions, use Chinese queries; for English questions, use English queries\n"
+            "- Each query should be 5-15 words, specific and search-friendly\n\n"
+            "Output ONLY the search queries, one per line. No numbering, no bullets, no explanation.\n"
+        )
+        user_prompt = f"Question: {question}"
+        return self._call_llm_generic(system_prompt, user_prompt, temperature=0.0, max_tokens=200, purpose="decompose_question")
+
     def _rewrite_query_llm(self, query: str) -> str:
         """Rewrite query to be retrieval-friendly."""
         system_prompt = "You are a search query optimizer. Rewrite the query to be concise and retrieval-friendly. Return only the rewritten query."
@@ -398,8 +416,24 @@ FINAL ANSWER:
 
     def _extract_answer_llm(self, question: str, evidence: str) -> str:
         """Extract short answer from evidence."""
-        system_prompt = "You answer questions using provided evidence. Return only the short final answer with no extra text."
-        user_prompt = f"Question: {question}\nEvidence:\n{evidence}\nAnswer:"
+        system_prompt = (
+            "You are a precise question answering system. Use the provided evidence AND your own knowledge to answer the question.\n\n"
+            "CRITICAL RULES:\n"
+            "- Return ONLY the answer itself — a name, number, year, title, or short phrase\n"
+            "- NEVER return generic role words like 'Author', 'Director', 'The president', 'The company' etc. Return the ACTUAL specific name/entity\n"
+            "- NEVER include explanations, reasoning, preamble, or sentences\n"
+            "- If the question asks 'who is the author', return the person's actual name (e.g. 'James Lockhart'), NOT the word 'Author'\n"
+            "- If the question asks for a company/organization name, return the full official name (e.g. 'RepRapPro Ltd')\n"
+            "- If the question asks for a number or count, return ONLY the number (e.g. '591')\n"
+            "- If the question asks for a year, return ONLY the 4-digit year (e.g. '1979')\n"
+            "- If the question asks for a device/equipment name, prefer the simplest common name (e.g. 'radio' not 'radio receiver')\n"
+            "- Match the language and format requested in the question exactly\n"
+            "- If the answer is in Chinese, respond in Chinese; if in English, respond in English\n"
+            "- Use evidence clues combined with your knowledge to determine the answer\n"
+            "- NEVER say 'Unknown' if the evidence gives any clue — use your best reasoning\n"
+            "- Your answer should typically be 1-5 words. If longer, you are probably doing it wrong.\n"
+        )
+        user_prompt = f"Question: {question}\n\nEvidence:\n{evidence}\n\nAnswer (just the answer, nothing else):"
         return self._call_llm_generic(system_prompt, user_prompt, temperature=0.0, max_tokens=128, purpose="extract_answer")
 
     def _verify_answer_llm(self, question: str, answer: str, evidence: str):
@@ -461,7 +495,7 @@ FINAL ANSWER:
             endpoint = "https://api.search.brave.com/res/v1/web/search"
             params = {
                 "q": query,
-                "count": 5
+                "count": 10
             }
             headers = {
                 "Accept": "application/json",
@@ -473,7 +507,7 @@ FINAL ANSWER:
             data = response.json()
             results = data.get("web", {}).get("results", [])
             formatted = []
-            for item in results[:5]:
+            for item in results[:10]:
                 formatted.append({
                     "title": item.get("title", ""),
                     "url": item.get("url", ""),
