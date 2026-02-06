@@ -100,8 +100,12 @@ class ConstrainedSearchAgent:
                         # Remove numbered prefixes like "1.", "1)", "- "
                         line = re.sub(r"^\d+[\.\)]\s*", "", line)
                         line = re.sub(r"^[-\u2022]\s*", "", line)
+                        # Remove labels like "Queries:", "Search:", etc.
+                        line = re.sub(r"^(?:Queries?|Search|Query)\s*:\s*", "", line, flags=re.IGNORECASE)
                         line = line.strip().strip('"').strip("'")
-                        if line and len(line) >= 4:
+                        # Require at least 8 chars AND at least 2 words to avoid garbage generic queries
+                        word_count = len(line.split())
+                        if line and len(line) >= 8 and word_count >= 2:
                             queries.append(line)
             except Exception:
                 pass
@@ -251,6 +255,13 @@ class ConstrainedSearchAgent:
             r"^based\s+on\s+the\s+(?:evidence|information|search\s+results)[,:]?\s*",
             r"^according\s+to\s+the\s+(?:evidence|sources?)[,:]?\s*",
             r"^from\s+the\s+evidence[,:]?\s*",
+            r"^therefore[,:]?\s*",
+            r"^thus[,:]?\s*",
+            r"^so[,:]?\s*",
+            r"^in\s+conclusion[,:]?\s*",
+            r"^the\s+name\s+(?:of\s+)?(?:the\s+)?(?:\w+\s+)?is\s*:?\s*",
+            r"^(?:it\s+is|it\'s)\s+",
+            r"^this\s+(?:is|was)\s+",
         ]
         cleaned = answer
         for prefix in prefixes:
@@ -262,6 +273,8 @@ class ConstrainedSearchAgent:
         if len(cleaned) >= 2:
             if (cleaned[0] in '"\'«\u201c\u300c' and cleaned[-1] in '"\'»\u201d\u300d'):
                 cleaned = cleaned[1:-1].strip()
+        # Remove markdown bold markers
+        cleaned = re.sub(r'\*\*(.+?)\*\*', r'\1', cleaned).strip()
         return cleaned
 
     def _tokenize_terms(self, query: str) -> List[str]:
@@ -366,6 +379,58 @@ class ConstrainedSearchAgent:
             return short
         return ""
 
+    def _format_final_answer(self, question: str, answer: str) -> str:
+        """Post-process the final answer to match expected output format based on question hints."""
+        if not answer or answer == "Unknown":
+            return answer
+
+        q_lower = question.lower()
+
+        # For year-only questions: extract just the 4-digit year
+        if any(k in question for k in ["直接回答数字", "Answer with Arabic numerals", "Answer with the four-digit year"]):
+            nums = re.findall(r'\b(1[5-9]\d{2}|20\d{2})\b', answer)
+            if nums:
+                return nums[0]
+            # Try to extract any number
+            nums = re.findall(r'\b(\d+)\b', answer)
+            if nums:
+                return nums[0]
+
+        # For number-only questions: extract just the number
+        if "answer with arabic numeral" in q_lower or "provide your answer as a numerical digit" in q_lower:
+            nums = re.findall(r'\b(\d+(?:\.\d+)?)\b', answer)
+            if nums:
+                return nums[0]
+
+        # For "Answer with the person's first name and last name only" questions
+        if "first name and last name only" in q_lower or "first and last" in q_lower:
+            # Remove titles and qualifiers
+            cleaned = re.sub(r'^(?:Sir|Dr|Prof|Mr|Mrs|Ms|Lord|Lady|Baron|Count|Duke)\s+', '', answer, flags=re.IGNORECASE).strip()
+            # Remove anything after a comma or parenthesis
+            cleaned = re.split(r'[,(]', cleaned)[0].strip()
+            if cleaned:
+                return cleaned
+
+        # For English name questions
+        if "please answer with english name" in q_lower:
+            # Remove non-English characters and keep only the English part
+            english_parts = re.findall(r'[A-Za-z][A-Za-z\s\-]+', answer)
+            if english_parts:
+                best = max(english_parts, key=len).strip()
+                if best:
+                    return best
+
+        # For "Answer with the central figure's name written in French"
+        if "written in french" in q_lower:
+            # Keep the answer as-is if it looks like French (has accents)
+            pass
+
+        # Remove trailing period for short answers
+        if len(answer) < 100 and answer.endswith('.'):
+            answer = answer[:-1].strip()
+
+        return answer
+
     def answer(self, question: str) -> Dict[str, Any]:
         """Generate answer using knowledge-first, search-augmented approach."""
         parsed = self.parse_question(question)
@@ -446,6 +511,9 @@ class ConstrainedSearchAgent:
             final_answer = knowledge_answer
         elif heuristic_answer and not self._is_refusal_or_unknown(heuristic_answer):
             final_answer = heuristic_answer
+
+        # Phase 4: Format-aware post-processing
+        final_answer = self._format_final_answer(question, final_answer)
 
         reasoning_steps.append(f"Evidence count: {len(evidence)}")
         reasoning_steps.append(f"Knowledge answer: {knowledge_answer}")
