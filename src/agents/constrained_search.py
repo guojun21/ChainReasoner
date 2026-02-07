@@ -484,9 +484,10 @@ class ConstrainedSearchAgent:
             if processed2:
                 search_answer = processed2
 
-        # Phase 2.5: Iterative hop-2 search
-        # If we got an intermediate answer, use it to do a second round of targeted search
+        # Phase 2.5: Hop-2 iterative search — use intermediate answer to do a
+        # second round of targeted search. Now safe because IQS MCP has no rate limit.
         hop1_answer = search_answer or knowledge_answer
+        hop2_answer = ""
         if hop1_answer and not self._is_refusal_or_unknown(hop1_answer) and self.llm_decompose_fn:
             hop2_queries = self._generate_hop2_queries(question, hop1_answer, evidence_text)
             if hop2_queries:
@@ -494,34 +495,72 @@ class ConstrainedSearchAgent:
                 hop2_texts, hop2_ranked, hop2_traces = self._do_search_round(hop2_queries)
                 search_traces.extend(hop2_traces)
 
-                # Combine hop1 and hop2 evidence
-                combined_results = all_ranked_results + hop2_ranked
-                combined_evidence = self._select_evidence(combined_results)
+                # Merge hop-2 evidence with hop-1 evidence
+                hop2_evidence = self._select_evidence(hop2_ranked)
+                combined_evidence = evidence + hop2_evidence
+                # Deduplicate and re-rank
+                combined_evidence = self._select_evidence(combined_evidence)
                 combined_evidence_text = self._build_evidence_text(combined_evidence)
 
-                if combined_evidence_text and self.llm_answer_fn:
-                    hop2_augmented = (
-                        f"Preliminary answer from first round: {hop1_answer}\n\n"
-                        f"Combined evidence from two search rounds:\n{combined_evidence_text}"
+                # Re-query LLM with enriched evidence from both hops
+                if self.llm_answer_fn and combined_evidence_text:
+                    hop2_context = (
+                        f"Original question: {question}\n\n"
+                        f"First-round intermediate answer: {hop1_answer}\n\n"
+                        f"Combined evidence from two rounds of search:\n{combined_evidence_text}"
                     )
-                    hop2_llm_answer = self.llm_answer_fn(question, hop2_augmented[:12000])
-                    hop2_processed = self._process_llm_answer(hop2_llm_answer)
-                    if hop2_processed and not self._is_refusal_or_unknown(hop2_processed):
-                        search_answer = hop2_processed
-                        reasoning_steps.append(f"Hop-2 refined answer: {search_answer}")
+                    hop2_raw = self.llm_answer_fn(question, hop2_context[:12000])
+                    hop2_processed = self._process_llm_answer(hop2_raw)
+                    if hop2_processed:
+                        hop2_answer = hop2_processed
+                        reasoning_steps.append(f"Hop-2 answer: {hop2_answer}")
 
-        # Phase 3: Select best answer — prefer search-augmented > knowledge > heuristic
+        # Phase 3: Select best answer — prefer hop2 > search > knowledge > heuristic
         final_answer = "Unknown"
-        if search_answer and not self._is_refusal_or_unknown(search_answer):
+        answer_source = "none"
+        if hop2_answer and not self._is_refusal_or_unknown(hop2_answer):
+            final_answer = hop2_answer
+            answer_source = "hop2"
+        elif search_answer and not self._is_refusal_or_unknown(search_answer):
             final_answer = search_answer
+            answer_source = "search"
         elif knowledge_answer and not self._is_refusal_or_unknown(knowledge_answer):
             final_answer = knowledge_answer
+            answer_source = "knowledge"
         elif heuristic_answer and not self._is_refusal_or_unknown(heuristic_answer):
             final_answer = heuristic_answer
+            answer_source = "heuristic"
+
+        # Phase 4: Reverse verification — search for the answer itself to confirm
+        if (final_answer != "Unknown" and self.search_fn and self.llm_verify_fn
+                and answer_source in ("hop2", "search")):
+            try:
+                verify_query = f"{final_answer} {question[:80]}"
+                verify_result = self.search_fn(verify_query, {"original_query": verify_query})
+                verify_items = verify_result.get("results", []) if isinstance(verify_result, dict) else []
+                if verify_items:
+                    verify_evidence = self._build_evidence_text(verify_items[:5])
+                    if verify_evidence:
+                        is_valid = self._verify_answer(question, final_answer, verify_evidence)
+                        reasoning_steps.append(f"Reverse verify: {is_valid}")
+                        if not is_valid:
+                            # Answer not verified — fall back to next best
+                            reasoning_steps.append(f"Verification failed for '{final_answer}', trying fallback")
+                            fallback = None
+                            if answer_source == "hop2" and search_answer and not self._is_refusal_or_unknown(search_answer):
+                                fallback = search_answer
+                            elif knowledge_answer and not self._is_refusal_or_unknown(knowledge_answer):
+                                fallback = knowledge_answer
+                            if fallback:
+                                final_answer = fallback
+                                reasoning_steps.append(f"Fallback answer: {final_answer}")
+            except Exception:
+                pass  # Verification is best-effort, don't let it crash
 
         reasoning_steps.append(f"Evidence count: {len(evidence)}")
         reasoning_steps.append(f"Knowledge answer: {knowledge_answer}")
         reasoning_steps.append(f"Search answer: {search_answer}")
+        reasoning_steps.append(f"Hop-2 answer: {hop2_answer}")
         reasoning_steps.append(f"Final answer: {final_answer}")
 
         return {

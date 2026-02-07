@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Progressive evaluation with early stopping and regression detection.
-Stages: 5 -> 20 -> 100 with thresholds 2 and 8.
-Outputs JSON array with id + answer only.
+Stages: 5 -> 10 -> 20 -> 40 -> 60 -> 80 -> 100 with ~40% threshold at each gate.
+Outputs JSONL (one JSON object per line) — competition-required format.
 
 == 只进不退机制 ==
 评测前自动加载历史最佳答案（outputs/ 里分数最高的文件）作为 baseline。
@@ -21,6 +21,8 @@ _normalize_for_compare() 和 score_results() 是评分核心函数，
 最终比赛用比赛方的评分系统，不是本地的。
 """
 
+import argparse
+import io
 import json
 import re
 import sys
@@ -40,9 +42,37 @@ QUESTIONS_FILE = BASE_DIR / "data" / "qa" / "question.json"
 STANDARD_FILE = BASE_DIR / "data" / "qa" / "the_standard_answers.json"
 OUTPUT_DIR = AUTORUN_DIR / "outputs"
 SUMMARY_FILE = OUTPUT_DIR / "last_progressive_summary.json"
+LOG_DIR = BASE_DIR / "logs"
 
 # 并发 worker 数（受 Brave API rate limit 约束，不宜过大）
 MAX_WORKERS = 3
+
+
+# --------------- Tee: 同时输出到终端和日志文件 ---------------
+
+class TeeWriter:
+    """将 stdout 同时写到终端和日志 txt 文件。"""
+
+    def __init__(self, log_path: Path):
+        self._terminal = sys.stdout
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_file = open(log_path, "w", encoding="utf-8")
+
+    def write(self, message):
+        self._terminal.write(message)
+        self._log_file.write(message)
+        self._log_file.flush()
+
+    def flush(self):
+        self._terminal.flush()
+        self._log_file.flush()
+
+    def close(self):
+        self._log_file.close()
+
+    @property
+    def log_path(self) -> Path:
+        return Path(self._log_file.name)
 
 
 def _normalize_answer(value):
@@ -95,8 +125,27 @@ def score_results(results, standard_map):
 
 # --------------- 只进不退：历史最佳 baseline ---------------
 
+def _load_results_file(file_path: Path) -> list:
+    """Load answer results from either JSON array (.json) or JSONL (.jsonl) file."""
+    with open(file_path, "r", encoding="utf-8") as fh:
+        content = fh.read().strip()
+    if not content:
+        return []
+    # Try JSON array first
+    if content.startswith("["):
+        return json.loads(content)
+    # Otherwise treat as JSONL (one JSON object per line)
+    results = []
+    for line in content.split("\n"):
+        line = line.strip()
+        if line:
+            results.append(json.loads(line))
+    return results
+
+
 def _load_best_baseline(standard_map):
     """扫描 outputs/ 目录，找到分数最高的答案文件，返回其中答对的题目集合。
+    支持 .json (旧格式) 和 .jsonl (新格式) 两种文件。
     返回: (baseline_correct_ids: set, baseline_file: str, baseline_score: int)
     """
     if not OUTPUT_DIR.exists():
@@ -106,7 +155,8 @@ def _load_best_baseline(standard_map):
     best_file = None
 
     for f in OUTPUT_DIR.iterdir():
-        m = re.match(r"(\d+)分_\d+_answers\.json$", f.name)
+        # Match both old (.json) and new (.jsonl) naming
+        m = re.match(r"(\d+)分_\d+_answers\.jsonl?$", f.name)
         if m:
             file_score = int(m.group(1))
             if file_score > best_score:
@@ -117,8 +167,7 @@ def _load_best_baseline(standard_map):
         return set(), "", 0
 
     try:
-        with open(best_file, "r", encoding="utf-8") as fh:
-            baseline_results = json.load(fh)
+        baseline_results = _load_results_file(best_file)
     except Exception:
         return set(), "", 0
 
@@ -162,11 +211,13 @@ def _check_regression(results, standard_map, baseline_correct_ids):
 
 
 def save_results(results, score):
+    """Save results as JSONL (one JSON object per line) — the format required by the competition."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = OUTPUT_DIR / f"{score}分_{timestamp}_answers.json"
+    output_file = OUTPUT_DIR / f"{score}分_{timestamp}_answers.jsonl"
     with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+        for item in results:
+            f.write(json.dumps({"id": item["id"], "answer": item["answer"]}, ensure_ascii=False) + "\n")
     return output_file
 
 
@@ -216,11 +267,13 @@ def _run_stage_concurrent(server, questions, start_idx, end_idx):
             results_dict[idx] = result
             done_count += 1
             qid = result["id"]
-            ans_preview = result["answer"][:40]
+            ans_preview = result["answer"][:50]
+            pct = int(done_count / total * 100)
+            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
             with _print_lock:
                 print(
-                    f"  Q{qid} done ({done_count}/{total}) "
-                    f"{elapsed:.1f}s => {ans_preview}",
+                    f"  [{bar}] {pct:3d}% | Q{qid:>3} ({done_count}/{total}) "
+                    f"{elapsed:.0f}s => {ans_preview}",
                     flush=True,
                 )
 
@@ -228,7 +281,27 @@ def _run_stage_concurrent(server, questions, start_idx, end_idx):
     return [results_dict[i] for i in range(start_idx, end_idx)]
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Progressive evaluation for ChainReasoner")
+    parser.add_argument(
+        "--no-stage", "--full",
+        action="store_true",
+        dest="no_stage",
+        help="跳过分阶段门槛检查，直接跑完全部 100 题（退步检测仍生效）",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
+    # 设置 Tee: 终端输出同时写到 logs/eval_{timestamp}.txt
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = LOG_DIR / f"eval_{timestamp_str}.txt"
+    tee = TeeWriter(log_file)
+    sys.stdout = tee
+    print(f"[LOG] 日志文件: {log_file}", flush=True)
+
     if not QUESTIONS_FILE.exists():
         print(f"Questions file not found: {QUESTIONS_FILE}")
         return
@@ -249,7 +322,23 @@ def main():
     else:
         print("\n[Baseline] 无历史最佳记录，跳过退步检测\n", flush=True)
 
-    stages = [(5, 2), (20, 8), (100, None)]
+    # --no-stage / --full: 跳过分阶段，直接跑全部 100 题（一个大 stage）
+    if args.no_stage:
+        stages = [
+            (len(questions), None),  # 全部跑完，无门槛
+        ]
+        print("[MODE] --no-stage: 不分阶段，直接跑完全部 %d 题\n" % len(questions), flush=True)
+    else:
+        stages = [
+            (5,   1),     # Stage 5:   至少 1/5  = 20%  — 快速冒烟测试
+            (10,  3),     # Stage 10:  至少 3/10 = 30%  — 基本能力
+            (20,  7),     # Stage 20:  至少 7/20 = 35%  — 稳定性验证
+            (40,  16),    # Stage 40:  至少 16/40 = 40% — 中等要求
+            (60,  27),    # Stage 60:  至少 27/60 = 45% — 高于平均
+            (80,  40),    # Stage 80:  至少 40/80 = 50% — 半数正确
+            (100, None),  # Stage 100: 跑完所有（退步检测仍生效）
+        ]
+
     results = []
     current_count = 0
     last_output = None
@@ -258,18 +347,29 @@ def main():
         target = min(stage_total, len(questions))
         if current_count < target:
             stage_t0 = time.time()
-            print(f"\n=== Stage {stage_total} ({current_count}→{target}) workers={MAX_WORKERS} ===", flush=True)
+            new_count = target - current_count
+            print(f"\n{'='*60}", flush=True)
+            if args.no_stage:
+                print(f"  FULL RUN | 题目 Q{current_count}~Q{target-1} | 共 {new_count} 题 | workers={MAX_WORKERS}", flush=True)
+            else:
+                print(f"  STAGE {stage_total} | 题目 Q{current_count}~Q{target-1} | 新增 {new_count} 题 | workers={MAX_WORKERS}", flush=True)
+            print(f"{'='*60}", flush=True)
 
             stage_results = _run_stage_concurrent(server, questions, current_count, target)
             results.extend(stage_results)
 
             stage_elapsed = time.time() - stage_t0
-            print(f"=== Stage {stage_total} done in {stage_elapsed:.1f}s ===", flush=True)
+            print(f"{'='*60}", flush=True)
+            if args.no_stage:
+                print(f"  FULL RUN 完成 | 耗时 {stage_elapsed:.0f}s ({stage_elapsed/60:.1f}min)", flush=True)
+            else:
+                print(f"  STAGE {stage_total} 完成 | 耗时 {stage_elapsed:.0f}s ({stage_elapsed/60:.1f}min)", flush=True)
+            print(f"{'='*60}", flush=True)
 
         current_count = target
         score = score_results(results, standard_map)
 
-        # ---- 只进不退：检查退步 ----
+        # ---- 只进不退：检查退步（--no-stage 模式下也生效）----
         if baseline_correct_ids:
             regressions = _check_regression(results, standard_map, baseline_correct_ids)
             if regressions:
@@ -277,11 +377,11 @@ def main():
                 last_output = save_results(results, score)
 
                 print(f"\n{'='*60}", flush=True)
-                print(f"🚨 退步检测失败！本轮得 {score} 分，但有 {len(regressions)} 道题退步了", flush=True)
+                print(f"退步检测失败！本轮得 {score} 分，但有 {len(regressions)} 道题退步了", flush=True)
                 print(f"   Baseline: {baseline_score}分 ({baseline_file})", flush=True)
                 print(f"{'='*60}", flush=True)
                 for reg in regressions:
-                    print(f"  ❌ Q{reg['qid']}: baseline 答对 \"{reg['standard_answer']}\"", flush=True)
+                    print(f"  X Q{reg['qid']}: baseline 答对 \"{reg['standard_answer']}\"", flush=True)
                     print(f"     本轮答了 \"{reg['current_answer']}\" — 退步！", flush=True)
                 print(f"{'='*60}", flush=True)
                 print(f"\n结论：代码修改导致退步，必须回滚或修复以上退步的题目。", flush=True)
@@ -312,7 +412,11 @@ def main():
                 write_summary(summary)
                 print(f"Output: {last_output}")
                 print(f"Summary: {SUMMARY_FILE}")
-                return  # 立即终止
+                # --no-stage 模式下退步也不中断，只记录警告，继续跑完
+                if not args.no_stage:
+                    return  # 分阶段模式下立即终止
+                else:
+                    print("[--no-stage] 退步已记录，继续跑完剩余题目\n", flush=True)
         # ---- /只进不退 ----
 
         last_output = save_results(results, score)
@@ -326,13 +430,28 @@ def main():
             "output_file": str(last_output)
         }
         write_summary(summary)
-        print(f"Stage {stage_total} Score: {score}")
+
+        if args.no_stage:
+            print(f"\nFinal Score: {score}/{current_count}")
+        else:
+            print(f"Stage {stage_total} Score: {score}")
         print(f"Output: {last_output}")
         print(f"Summary: {SUMMARY_FILE}")
 
-        if threshold is not None and score < threshold:
+        if not args.no_stage and threshold is not None and score < threshold:
             print("Stage failed, stopping early.")
             break
+
+    # --no-stage: 全部跑完后也生成 submit 文件
+    if args.no_stage and results:
+        submit_file = OUTPUT_DIR / f"{score}分_{datetime.now().strftime('%Y%m%d_%H%M%S')}_submit.jsonl"
+        with open(submit_file, "w", encoding="utf-8") as f:
+            for q in questions:
+                qid = q.get("id")
+                matched = next((r for r in results if r["id"] == qid), None)
+                ans = matched["answer"] if matched else "Unknown"
+                f.write(json.dumps({"id": qid, "answer": ans}, ensure_ascii=False) + "\n")
+        print(f"\nSubmit file: {submit_file}")
 
 
 if __name__ == "__main__":

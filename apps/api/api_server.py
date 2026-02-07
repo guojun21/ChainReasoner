@@ -27,6 +27,149 @@ sys.path.insert(0, str(BASE_DIR))
 
 from src.utils.logger_config import get_logger, MultiHopLogger
 from src.agents.constrained_search import ConstrainedSearchAgent
+from src.search.client import BraveSearchClient, HybridSearchClient, IQSSearchClient
+
+
+# ──────────────────────────────────────────────────────────
+# 通用 MCP HTTP 客户端（配置驱动）
+# 支持任何基于 JSON-RPC 2.0 over HTTP 的 MCP 服务
+# ──────────────────────────────────────────────────────────
+import re as _re
+import threading as _threading
+
+
+class MCPHttpClient:
+    """通用 MCP HTTP 客户端 — 适配任何 streamableHttp 模式的 MCP 服务器。
+
+    从 mcp_config.json 中 type="http" 的配置构建：
+        {
+          "type": "http",
+          "url": "https://...",
+          "api_key": "...",
+          "tools": ["tool_a", "tool_b"],
+          "description": "..."
+        }
+
+    使用方式：
+        client = MCPHttpClient(url, api_key, logger)
+        text = client.call_tool("common_search", {"query": "..."})
+    """
+
+    def __init__(self, url: str, api_key: str, logger, *, timeout: int = 30):
+        self.url = url
+        self.api_key = api_key
+        self.logger = logger
+        self.timeout = timeout
+        self._req_id = 0
+        self._lock = _threading.Lock()
+        self._initialized = False
+
+    # ── 内部方法 ──
+
+    def _next_id(self) -> int:
+        self._req_id += 1
+        return self._req_id
+
+    def _headers(self) -> dict:
+        h = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self.api_key:
+            h["X-API-Key"] = self.api_key
+        return h
+
+    def _ensure_initialized(self):
+        """JSON-RPC initialize + notifications/initialized 握手（线程安全，仅一次）"""
+        if self._initialized:
+            return
+        with self._lock:
+            if self._initialized:
+                return
+            try:
+                r = requests.post(self.url, headers=self._headers(), json={
+                    "jsonrpc": "2.0",
+                    "id": self._next_id(),
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "ChainReasoner", "version": "1.0.0"},
+                    },
+                }, timeout=15)
+                r.raise_for_status()
+
+                requests.post(self.url, headers=self._headers(), json={
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                }, timeout=10)
+
+                self._initialized = True
+                self.logger.info(f"MCP HTTP initialized: {self.url}")
+            except Exception as e:
+                self.logger.error(f"MCP HTTP init failed ({self.url}): {e}")
+
+    # ── 公开接口 ──
+
+    def call_tool(self, tool_name: str, arguments: dict) -> str:
+        """调用 MCP tools/call，返回拼接后的 text 内容（失败返回空串）。"""
+        self._ensure_initialized()
+        try:
+            r = requests.post(self.url, headers=self._headers(), json={
+                "jsonrpc": "2.0",
+                "id": self._next_id(),
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            }, timeout=self.timeout)
+            r.raise_for_status()
+            body = r.json()
+            contents = body.get("result", {}).get("content", [])
+            texts = [c.get("text", "") for c in contents if c.get("type") == "text"]
+            return "\n".join(texts)
+        except Exception as e:
+            self.logger.error(f"MCP call_tool({tool_name}) error: {e}")
+            self._initialized = False  # 下次重新握手
+            return ""
+
+
+def _load_mcp_http_clients(mcp_config: dict, logger) -> Dict[str, MCPHttpClient]:
+    """从 mcp_config.json 中加载所有 type='http' 的服务，返回 {name: MCPHttpClient}。"""
+    clients: Dict[str, MCPHttpClient] = {}
+    for name, cfg in mcp_config.get("mcpServers", {}).items():
+        if cfg.get("type") != "http":
+            continue
+        url = cfg.get("url", "")
+        api_key = cfg.get("api_key", "")
+        if not url:
+            logger.warning(f"MCP HTTP service '{name}' has no url, skipping")
+            continue
+        clients[name] = MCPHttpClient(url, api_key, logger)
+        logger.info(f"MCP HTTP client registered: {name} -> {url}")
+    return clients
+
+
+def _parse_search_markdown(md_text: str) -> list:
+    """将 IQS common_search / litesearch 返回的 markdown 解析为 [{title, url, content}]。"""
+    results = []
+    blocks = _re.split(r'\n---\n?', md_text)
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        title = url = content = ""
+        m = _re.search(r'##\s*(?:标题\s*)?(.+)', block)
+        if m:
+            title = m.group(1).strip()
+        m = _re.search(r'\*\*url\*\*[：:]\s*(https?://\S+)', block)
+        if m:
+            url = m.group(1).strip()
+        m = _re.search(r'\*\*摘要\*\*[：:]\s*(.+)', block, _re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+            content = _re.split(r'\n-\s*\*\*', content)[0].strip()
+        if title or content:
+            results.append({"title": title, "url": url, "content": content})
+    return results
 
 
 class EnhancedMultiHopAPIServer:
@@ -43,21 +186,29 @@ class EnhancedMultiHopAPIServer:
         self.api_token = self.config.get("api_token", "default_token_123456")
         self.mcp_config = self._load_mcp_config()
         search_cfg = self.config.get("search_agent", {}) if isinstance(self.config, dict) else {}
-        self._brave_min_interval = max(search_cfg.get("brave_min_interval_seconds", 1.2), 1.5)
+
+        # ── 从 mcp_config.json 加载所有 HTTP MCP 客户端 ──
+        self._mcp_http = _load_mcp_http_clients(self.mcp_config, self.logger)
+
+        # ── Brave rate limit 保留（作为 fallback 备用）──
+        cfg_interval = search_cfg.get("brave_min_interval_seconds", 1.5)
+        self._brave_min_interval = min(max(cfg_interval, 1.2), 2.0)
         self._brave_last_call_ts = 0.0
-        # [THREAD-SAFE] Lock for Brave rate limiting — needed for concurrent eval
         import threading
         self._brave_lock = threading.Lock()
-        search_cfg = self.config.get("search_agent", {}) if isinstance(self.config, dict) else {}
+
+        # ── Build Hybrid search client (Brave for EN, IQS for ZH) ──
+        self._hybrid_search = self._build_hybrid_search()
+
         enable_rewrite = search_cfg.get("enable_rewrite", True)
         enable_llm_answer = search_cfg.get("enable_llm_answer", True)
         enable_llm_verify = search_cfg.get("enable_llm_verify", True)
         self.search_agent = ConstrainedSearchAgent(
-            self._call_brave_search,
-            max_queries=max(search_cfg.get("max_queries", 3), 3),  # 3 queries for hop-1, saving budget for hop-2
+            self._hybrid_search_fn,  # ← Hybrid: Brave(EN) + IQS(ZH)
+            max_queries=max(search_cfg.get("max_queries", 5), 5),  # 5 queries for hop-1 (IQS has no rate limit)
             per_query_delay=search_cfg.get("per_query_delay", 0.2),
-            max_results_per_query=max(search_cfg.get("max_results_per_query", 8), 8),
-            max_evidence=max(search_cfg.get("max_evidence", 8), 8),
+            max_results_per_query=max(search_cfg.get("max_results_per_query", 10), 10),  # 10 results per query
+            max_evidence=max(search_cfg.get("max_evidence", 12), 12),  # 12 evidence items
             adaptive_threshold_n=search_cfg.get("adaptive_threshold_n", 0.5),
             rewrite_fn=None,  # Disabled: rewriting strips critical context
             llm_answer_fn=self._extract_answer_llm if enable_llm_answer else None,
@@ -85,7 +236,27 @@ class EnhancedMultiHopAPIServer:
             with open(DEFAULT_MCP_CONFIG_PATH, 'r', encoding='utf-8') as f:
                 return json.load(f)
         return {"mcpServers": {}}
-    
+
+    def _build_hybrid_search(self) -> HybridSearchClient:
+        """Build HybridSearchClient: Brave MCP for English, IQS for Chinese."""
+        iqs = IQSSearchClient.from_mcp_config(self.mcp_config)
+        # Prefer MCP-based Brave, fall back to config-based (HTTP-only)
+        brave = BraveSearchClient.from_mcp_config(self.mcp_config)
+        if brave is None:
+            brave = BraveSearchClient.from_config(self.config)
+        if brave:
+            self.logger.info("Brave search available — Hybrid mode: EN→Brave MCP, ZH→IQS")
+        else:
+            self.logger.info("No Brave key — IQS only")
+        return HybridSearchClient(iqs=iqs, brave=brave)
+
+    def _hybrid_search_fn(self, query: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Search dispatch: uses HybridSearchClient (Brave for EN, IQS for ZH).
+        Falls back to _call_iqs_search if hybrid client not available."""
+        if self._hybrid_search:
+            return self._hybrid_search.search(query, meta)
+        return self._call_iqs_search(query, meta)
+
     def _call_llm(self, question: str) -> Dict[str, Any]:
         """Call LLM API with reasoning process."""
         start_time = time.time()
@@ -168,118 +339,58 @@ FINAL ANSWER:
             }
     
     def _call_mcp_service(self, service_name: str, query: str) -> Dict[str, Any]:
-        """Call MCP service for additional information."""
+        """通用 MCP 服务调用入口 — 支持 http 和 stdio 两种类型。"""
         start_time = time.time()
-        
         self.logger.info(f"MCP Service Call - {service_name}")
-        self.logger.debug(f"Query: {query[:100]}...")
-        
+
         mcp_servers = self.mcp_config.get("mcpServers", {})
-        
         if service_name not in mcp_servers:
-            self.logger.error(f"MCP Service - {service_name} not found in configuration")
             return {
                 "error": f"MCP service '{service_name}' not found",
-                "available_services": list(mcp_servers.keys())
+                "available_services": list(mcp_servers.keys()),
             }
-        
-        service_config = mcp_servers[service_name]
-        self.logger.debug(f"Service config: {service_config}")
-        
+
+        cfg = mcp_servers[service_name]
+        svc_type = cfg.get("type", "stdio")
+
         try:
-            if service_name == "searxng":
-                result = self._call_searxng(query)
+            # ── HTTP 类型：通过 MCPHttpClient 调用 ──
+            if svc_type == "http":
+                client = self._mcp_http.get(service_name)
+                if not client:
+                    return {"error": f"HTTP MCP client '{service_name}' not initialized"}
+                tools = cfg.get("tools", [])
+                tool_name = tools[0] if tools else service_name
+                text = client.call_tool(tool_name, {"query": query})
                 duration = time.time() - start_time
-                if "error" not in result:
-                    self.logger.info(f"MCP Service - {service_name} success (Duration: {duration:.2f}s)")
-                else:
-                    self.logger.error(f"MCP Service - {service_name} failed (Duration: {duration:.2f}s)")
-                return result
-            elif service_name == "web-search":
-                result = self._call_web_search(query)
-                duration = time.time() - start_time
-                if "error" not in result:
-                    self.logger.info(f"MCP Service - {service_name} success (Duration: {duration:.2f}s)")
-                else:
-                    self.logger.error(f"MCP Service - {service_name} failed (Duration: {duration:.2f}s)")
-                return result
-            elif service_name == "brave-search":
-                result = self._call_brave_search(query)
-                duration = time.time() - start_time
-                if "error" not in result:
-                    self.logger.info(f"MCP Service - {service_name} success (Duration: {duration:.2f}s)")
-                else:
-                    self.logger.error(f"MCP Service - {service_name} failed (Duration: {duration:.2f}s)")
-                return result
-            elif service_name == "mcp-deepwiki":
-                result = self._call_mcp_deepwiki(query)
-                duration = time.time() - start_time
-                if "error" not in result:
-                    self.logger.info(f"MCP Service - {service_name} success (Duration: {duration:.2f}s)")
-                else:
-                    self.logger.error(f"MCP Service - {service_name} failed (Duration: {duration:.2f}s)")
-                return result
-            elif service_name == "trends-hub":
-                result = self._call_trends_hub(query)
-                duration = time.time() - start_time
-                if "error" not in result:
-                    self.logger.info(f"MCP Service - {service_name} success (Duration: {duration:.2f}s)")
-                else:
-                    self.logger.error(f"MCP Service - {service_name} failed (Duration: {duration:.2f}s)")
-                return result
-            elif service_name == "arxiv-mcp-server":
-                result = self._call_arxiv_mcp(query)
-                duration = time.time() - start_time
-                if "error" not in result:
-                    self.logger.info(f"MCP Service - {service_name} success (Duration: {duration:.2f}s)")
-                else:
-                    self.logger.error(f"MCP Service - {service_name} failed (Duration: {duration:.2f}s)")
-                return result
-            elif service_name == "pozansky-stock-server":
-                result = self._call_pozansky_stock(query)
-                duration = time.time() - start_time
-                if "error" not in result:
-                    self.logger.info(f"MCP Service - {service_name} success (Duration: {duration:.2f}s)")
-                else:
-                    self.logger.error(f"MCP Service - {service_name} failed (Duration: {duration:.2f}s)")
-                return result
-            elif service_name == "worldbank-mcp":
-                result = self._call_worldbank_mcp(query)
-                duration = time.time() - start_time
-                if "error" not in result:
-                    self.logger.info(f"MCP Service - {service_name} success (Duration: {duration:.2f}s)")
-                else:
-                    self.logger.error(f"MCP Service - {service_name} failed (Duration: {duration:.2f}s)")
-                return result
-            elif service_name == "mcp-server-hotnews":
-                result = self._call_hotnews(query)
-                duration = time.time() - start_time
-                if "error" not in result:
-                    self.logger.info(f"MCP Service - {service_name} success (Duration: {duration:.2f}s)")
-                else:
-                    self.logger.error(f"MCP Service - {service_name} failed (Duration: {duration:.2f}s)")
-                return result
-            elif service_name == "biomcp":
-                result = self._call_biomcp(query)
-                duration = time.time() - start_time
-                if "error" not in result:
-                    self.logger.info(f"MCP Service - {service_name} success (Duration: {duration:.2f}s)")
-                else:
-                    self.logger.error(f"MCP Service - {service_name} failed (Duration: {duration:.2f}s)")
-                return result
-            else:
-                self.logger.warning(f"MCP Service - {service_name} not implemented")
+                self.logger.info(f"MCP HTTP {service_name} done ({duration:.2f}s, {len(text)} chars)")
                 return {
-                    "error": f"MCP service '{service_name}' not yet implemented",
-                    "note": "This service is configured but not yet integrated"
+                    "service": service_name,
+                    "query": query,
+                    "results": [{"title": service_name, "url": "", "content": text[:3000]}] if text else [],
+                    "count": 1 if text else 0,
                 }
+
+            # ── stdio 类型：通过 subprocess 调用（兼容旧逻辑）──
+            command = cfg.get("command", "")
+            args = cfg.get("args", [])
+            if not command:
+                return {"error": f"MCP service '{service_name}' has no command"}
+            # 特殊处理旧的 direct-HTTP 服务
+            if service_name == "searxng":
+                return self._call_searxng(query)
+            elif service_name == "web-search":
+                return self._call_web_search(query)
+            elif service_name == "brave-search":
+                return self._call_brave_search(query)
+            else:
+                return self._call_mcp_service_generic(
+                    service_name, [command] + args, service_name, query
+                )
         except Exception as e:
             duration = time.time() - start_time
-            self.logger.error(f"MCP Service - {service_name} exception (Duration: {duration:.2f}s)")
-            MultiHopLogger.log_error(self.logger, e, f"MCP service call: {service_name}")
-            return {
-                "error": f"MCP service error: {str(e)}"
-            }
+            self.logger.error(f"MCP Service - {service_name} exception ({duration:.2f}s): {e}")
+            return {"error": f"MCP service error: {str(e)}"}
     
     def _call_searxng(self, query: str) -> Dict[str, Any]:
         """Call SearXNG search service."""
@@ -439,35 +550,46 @@ FINAL ANSWER:
         return raw.strip()
 
     def _decompose_question_llm(self, question: str) -> str:
-        """Use LLM to decompose a complex multi-hop question into effective web search queries."""
+        """Use LLM to decompose a complex multi-hop question into effective web search queries.
+        
+        Enhanced with multi-hop reasoning chain identification:
+        the LLM first analyzes how many hops are needed, then generates
+        targeted queries for the FIRST hop (hop-2 queries are generated
+        separately by _generate_hop2_queries after hop-1 results are in).
+        """
         system_prompt = (
-            "You are an expert at formulating web search queries for multi-hop questions. "
-            "Given a complex question, identify the KEY entities/facts described, then generate "
-            "3-5 highly targeted search queries that will find the specific answer.\n\n"
-            "CRITICAL RULES:\n"
-            "1. Each query must be 5-20 words with SPECIFIC details from the question\n"
-            "2. NEVER use single generic words like 'author', 'spiritual', 'thesis'\n"
-            "3. Include proper nouns, dates, technical terms, and distinctive phrases\n"
-            "4. For multi-hop questions, create queries for EACH hop in the reasoning chain\n"
-            "5. For Chinese questions, write Chinese queries; for English, write English queries\n"
-            "6. Think about what Wikipedia article or authoritative source would answer this\n\n"
-            "EXAMPLES:\n\n"
+            "你是多跳推理问题的搜索查询专家。\n\n"
+            "## 任务\n"
+            "给定一个复杂问题，你需要：\n"
+            "1. 分析推理链：识别问题需要几跳推理（A→B→C 型）\n"
+            "2. 生成第一跳搜索词：3-5 个精准的搜索查询，用于找到推理链的第一个中间实体\n\n"
+            "## 关键规则\n"
+            "- 每个查询 5-20 个词，必须包含问题中的专有名词、年份、技术术语\n"
+            "- 禁止使用单个泛化词如 'author', 'spiritual', 'thesis'\n"
+            "- 中文问题用中文查询，英文问题用英文查询\n"
+            "- 思考哪个 Wikipedia 条目或权威来源能回答这个问题\n"
+            "- 对于多跳问题，第一跳的查询应聚焦于找到中间实体，而非最终答案\n\n"
+            "## 多跳推理示例\n\n"
+            "Question: 一位物理学领域的学者为一种经典棋盘游戏设计的评分系统，后来被一家北美游戏公司广泛应用...\n"
+            "分析：3跳问题。A(物理学家+棋盘游戏评分)→B(北美游戏公司)→C(格斗手游名)\n"
+            "第一跳查询（找中间实体A和B）：\n"
+            "Elo rating system physicist chess board game\n"
+            "Elo评分系统 物理学家 棋盘游戏 北美游戏公司\n"
+            "Riot Games Elo rating League of Legends\n\n"
             "Question: 一位欧洲学者的某项开源硬件项目...该实体在21世纪10年代中期停止了在其欧洲本土的主要交易...\n"
-            "Queries:\n"
+            "分析：2跳问题。A(开源硬件项目学者)→B(商业实体名称)\n"
+            "第一跳查询：\n"
             "RepRap 开源3D打印项目 创始人 Adrian Bowyer 商业实体\n"
             "RepRapPro Ltd 停止交易 2015年\n"
             "Adrian Bowyer Bath大学 退休 开源硬件\n\n"
             "Question: Who is the author of the article...prosopography...encomienda...1972 journal...\n"
-            "Queries:\n"
+            "分析：1跳问题。直接搜索文章作者。\n"
+            "查询：\n"
             "prosopography colonial Spanish America encomienda hacienda 1972 article\n"
             "Latin American Research Review 1972 import substitution industrialization\n"
             "James Lockhart social history colonial Spanish America\n\n"
-            "Question: There is a spiritual teacher...thirty letters...controversial guru...FBI file...\n"
-            "Queries:\n"
-            "Osho Rajneesh thirty letters book spiritual teacher\n"
-            "Bhagwan Shree Rajneesh FBI file total pages Scribd\n"
-            "Rajneesh FBI file public document pages count\n\n"
-            "Output ONLY the search queries, one per line. No numbering, no bullets, no explanation.\n"
+            "## 输出格式\n"
+            "只输出搜索查询，每行一个。不要编号、不要符号、不要解释。\n"
         )
         user_prompt = f"Question: {question}"
         return self._call_llm_generic(system_prompt, user_prompt, temperature=0.0, max_tokens=400, purpose="decompose_question")
@@ -546,8 +668,80 @@ FINAL ANSWER:
         except Exception as e:
             self.logger.error(f"Failed to write search trace: {e}")
 
+    # ──────────────────────────────────────────────────────────
+    # MCP 搜索（主搜索入口 — common_search + readpage_scrape）
+    # ──────────────────────────────────────────────────────────
+    def _call_iqs_search(self, query: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """调用 IQS MCP common_search 搜索 + readpage_scrape 抓取全文。
+        返回格式与旧 _call_brave_search 一致：
+            {"service": ..., "query": ..., "results": [{title, url, content}], "count": N}
+        """
+        start_time = time.time()
+        self.logger.info(f"MCP search: query={query[:80]}")
+
+        search_client = self._mcp_http.get("iqs-search")
+        readpage_client = self._mcp_http.get("iqs-readpage")
+
+        if not search_client:
+            self.logger.error("MCP search client 'iqs-search' not found in config")
+            return {"service": "mcp-search", "query": query, "results": [], "count": 0}
+
+        # ① common_search
+        md_text = search_client.call_tool("common_search", {"query": query})
+        if not md_text or md_text.strip() == "# 搜索结果":
+            self.logger.warning(f"MCP common_search returned empty for: {query[:60]}")
+            return {"service": "mcp-search", "query": query, "results": [], "count": 0}
+
+        formatted = _parse_search_markdown(md_text)
+
+        # ② readpage_scrape — 对 top 结果抓取全文，用全文替换摘要
+        if readpage_client and formatted:
+            top_n = min(5, len(formatted))  # 最多抓前 5 个（IQS 无限流）
+            for i in range(top_n):
+                page_url = formatted[i].get("url", "")
+                if not page_url:
+                    continue
+                try:
+                    page_text = readpage_client.call_tool(
+                        "readpage_scrape", {"url": page_url}
+                    )
+                    if page_text and len(page_text) > len(formatted[i].get("content", "")):
+                        # 截取前 2000 字符避免过长
+                        formatted[i]["content"] = page_text[:2000]
+                        self.logger.info(
+                            f"readpage_scrape enriched [{i}] {page_url[:60]} "
+                            f"({len(page_text)} chars)"
+                        )
+                except Exception as e:
+                    self.logger.warning(f"readpage_scrape failed for {page_url[:60]}: {e}")
+
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        top_titles = [item.get("title", "") for item in formatted[:3]]
+
+        self.logger.info(
+            f"MCP search ok: elapsed_ms={elapsed_ms} "
+            f"query={query[:80]} results={len(formatted)} top_titles={top_titles}"
+        )
+        self._log_search_trace({
+            "type": "mcp_common_search",
+            "query": query,
+            "original_query": (meta or {}).get("original_query"),
+            "rewritten_query": (meta or {}).get("rewritten_query"),
+            "elapsed_ms": elapsed_ms,
+            "result_count": len(formatted),
+            "top_titles": top_titles,
+            "readpage_enriched": min(3, len(formatted)) if readpage_client else 0,
+        })
+
+        return {
+            "service": "mcp-search",
+            "query": query,
+            "results": formatted,
+            "count": len(formatted),
+        }
+
     def _call_brave_search(self, query: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Call Brave Search API for web results."""
+        """Call Brave Search API for web results. (保留作为 fallback 备用)"""
         self.logger.info("Calling brave-search service with real data")
 
         api_key = self._get_brave_api_key()
@@ -559,12 +753,6 @@ FINAL ANSWER:
             }
 
         try:
-            # [THREAD-SAFE] Brave rate limiting with lock for concurrent eval
-            with self._brave_lock:
-                now = time.time()
-                if now - self._brave_last_call_ts < self._brave_min_interval:
-                    time.sleep(self._brave_min_interval - (now - self._brave_last_call_ts))
-                self._brave_last_call_ts = time.time()
             endpoint = "https://api.search.brave.com/res/v1/web/search"
             params = {
                 "q": query,
@@ -577,14 +765,21 @@ FINAL ANSWER:
             start_time = time.time()
             response = None
             for _retry in range(4):
-                response = requests.get(endpoint, headers=headers, params=params, timeout=30)
+                # [THREAD-SAFE] Hold lock for rate limit wait + actual HTTP request
+                # This ensures only ONE Brave request is in-flight at a time,
+                # preventing 429 cascades with concurrent workers.
+                with self._brave_lock:
+                    now = time.time()
+                    wait_needed = self._brave_min_interval - (now - self._brave_last_call_ts)
+                    if wait_needed > 0:
+                        time.sleep(wait_needed)
+                    response = requests.get(endpoint, headers=headers, params=params, timeout=30)
+                    self._brave_last_call_ts = time.time()
                 if response.status_code == 429:
-                    # Aggressive exponential backoff: 15, 30, 60, 120 seconds
-                    wait_time = 15 * (2 ** _retry)
+                    # Exponential backoff: 10, 20, 40, 80 seconds
+                    wait_time = 10 * (2 ** _retry)
                     self.logger.warning(f"Brave 429 rate limited, retrying in {wait_time}s (attempt {_retry+1}/4)...")
                     time.sleep(wait_time)
-                    with self._brave_lock:
-                        self._brave_last_call_ts = time.time()
                     continue
                 break
             response.raise_for_status()
