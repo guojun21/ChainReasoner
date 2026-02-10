@@ -30,6 +30,8 @@ ODR_CONFIG = OPEN_DEEP_RESEARCH_DIR / "src" / "open_deep_research" / "configurat
 
 
 class OpenClawClient:
+    """MCP client that drives the optimisation loop via tool calls."""
+
     def __init__(self, mcp_url: str = MCP_URL):
         self.mcp_url = mcp_url
 
@@ -62,29 +64,34 @@ class OpenClawClient:
 
 
 def parse_yaml(content: str) -> Dict[str, Any]:
+    """Parse YAML string into dict."""
     return yaml.safe_load(content) or {}
 
 
 def load_json(path: Path) -> Dict[str, Any]:
+    """Load JSON file; return empty dict if missing."""
     if not path.exists():
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 def save_json(path: Path, data: Dict[str, Any]):
+    """Write dict as pretty JSON."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
 
 
 def read_tail(content: str, max_chars: int = 4000) -> str:
+    """Return last N chars of a string — for log excerpts."""
     if not content:
         return ""
     return content[-max_chars:]
 
 
 def heuristic_tuning(score: int, current: Dict[str, Any]) -> Dict[str, Any]:
+    """Adjust search_agent params when LLM suggestion unavailable."""
     tuning = dict(current)
     if score < 2:
         tuning["max_queries"] = min(6, current.get("max_queries", 4) + 1)
@@ -99,7 +106,10 @@ def heuristic_tuning(score: int, current: Dict[str, Any]) -> Dict[str, Any]:
     return tuning
 
 
-def build_prompt(odr_claude: str, odr_readme: str, odr_prompts: str, odr_config: str, summary: Dict[str, Any], api_log: str, trace_log: str) -> str:
+def build_prompt(odr_claude: str, odr_readme: str, odr_prompts: str,
+                 odr_config: str, summary: Dict[str, Any],
+                 api_log: str, trace_log: str) -> str:
+    """Build the LLM prompt that requests config tuning suggestions."""
     return f"""You are OpenClaw optimizer. Use open_deep_research as the primary reference.
 
 ## Open Deep Research CLAUDE
@@ -130,25 +140,22 @@ def build_prompt(odr_claude: str, odr_readme: str, odr_prompts: str, odr_config:
 
 
 def apply_tuning(config: Dict[str, Any], tuning: Dict[str, Any]) -> Dict[str, Any]:
-    search_cfg = config.get("search_agent", {})
+    """Merge tuning suggestions into config.yaml's search_agent section."""
+    search_config = config.get("search_agent", {})
+    allowed_keys = {
+        "max_queries", "per_query_delay", "max_results_per_query",
+        "max_evidence", "adaptive_threshold_n", "brave_min_interval_seconds",
+        "enable_rewrite", "enable_llm_answer", "enable_llm_verify",
+    }
     for key, value in tuning.items():
-        if key in [
-            "max_queries",
-            "per_query_delay",
-            "max_results_per_query",
-            "max_evidence",
-            "adaptive_threshold_n",
-            "brave_min_interval_seconds",
-            "enable_rewrite",
-            "enable_llm_answer",
-            "enable_llm_verify"
-        ]:
-            search_cfg[key] = value
-    config["search_agent"] = search_cfg
+        if key in allowed_keys:
+            search_config[key] = value
+    config["search_agent"] = search_config
     return config
 
 
 def run_round(client: OpenClawClient, round_id: int, round_minutes: int = 30) -> Optional[Dict[str, Any]]:
+    """Execute one optimisation round: eval -> analyse -> tune -> wait."""
     start_time = time.time()
     print(f"Round {round_id} starting...")
 
@@ -184,9 +191,9 @@ def run_round(client: OpenClawClient, round_id: int, round_minutes: int = 30) ->
 
     config_content = client.read_file(CONFIG_FILE)
     config = parse_yaml(config_content)
-    search_cfg = config.get("search_agent", {})
+    search_config = config.get("search_agent", {})
     if not tuning:
-        tuning = heuristic_tuning(summary.get("score", 0), search_cfg)
+        tuning = heuristic_tuning(summary.get("score", 0), search_config)
 
     updated = apply_tuning(config, tuning)
     client.write_file(CONFIG_FILE, yaml.safe_dump(updated, allow_unicode=True, sort_keys=False))
