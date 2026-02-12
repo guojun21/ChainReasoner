@@ -212,28 +212,114 @@ def extract_concise_answer_from_evidence_using_llm(base_model: dict, question: s
 
 def verify_answer_against_evidence_via_llm(base_model: dict, question: str, answer: str,
                       evidence: str, logger=None, trace_logger=None) -> Tuple[str, float]:
-    """Verify answer against evidence. Returns (label, confidence)."""
+    """Verify answer against evidence with structured few-shot verification.
+
+    Why (P0-c SelfVerifier enhancement, from Enhancing-Multi-Hop-QA):
+    The old prompt was too simple (single-line "LABEL|CONFIDENCE").
+    The enhanced prompt uses 3 few-shot examples covering SUPPORTS, REFUTES,
+    and INSUFFICIENT verdicts, producing more calibrated confidence scores
+    and better reasoning about whether the evidence actually supports the answer.
+
+    Returns (label, confidence) where label is SUPPORTS/REFUTES/INSUFFICIENT.
+    """
     system_prompt = (
-        "You are a verifier. Given question, answer, and evidence, respond with "
-        "one label SUPPORTS, REFUTES, or INSUFFICIENT and a confidence 0-1. "
-        "Format: LABEL|CONFIDENCE"
+        "You are a rigorous answer verification agent. Given a question, a proposed answer, "
+        "and evidence, determine whether the evidence supports the answer.\n\n"
+        "## Output Format\n"
+        "Verdict: SUPPORTS | REFUTES | INSUFFICIENT\n"
+        "Confidence: 0.00-1.00\n"
+        "Reasoning: <one sentence explaining why>\n\n"
+        "## Rules\n"
+        "- SUPPORTS: Evidence clearly and directly confirms the answer (confidence >= 0.7)\n"
+        "- REFUTES: Evidence clearly contradicts the answer or names a different entity (confidence >= 0.7)\n"
+        "- INSUFFICIENT: Evidence does not mention the answer or is ambiguous (confidence < 0.7)\n"
+        "- Pay special attention to EXACT entity names — 'RepRap' ≠ 'RepRapPro', '福临' ≠ '皇太极'\n"
+        "- If the answer is a partial match of the correct entity, mark as REFUTES\n\n"
+        "## Examples\n"
+        "Q: Who founded RepRapPro? A: Adrian Bowyer. Evidence: 'Adrian Bowyer founded RepRapPro Ltd in 2011'\n"
+        "Verdict: SUPPORTS\nConfidence: 0.95\nReasoning: Evidence directly names Adrian Bowyer as founder\n\n"
+        "Q: What company did he create? A: RepRap Ltd. Evidence: 'He created RepRapPro Ltd'\n"
+        "Verdict: REFUTES\nConfidence: 0.92\nReasoning: Evidence says RepRapPro Ltd, not RepRap Ltd — different entity\n\n"
+        "Q: When was it dissolved? A: 2016. Evidence: 'The company was established in Bath'\n"
+        "Verdict: INSUFFICIENT\nConfidence: 0.20\nReasoning: Evidence mentions location but not dissolution date\n"
     )
-    user_prompt = f"Question: {question}\nAnswer: {answer}\nEvidence:\n{evidence}\nVerdict:"
+    user_prompt = (
+        f"Question: {question}\n"
+        f"Proposed Answer: {answer}\n"
+        f"Evidence:\n{evidence[:6000]}\n\n"
+        f"Provide your verdict:"
+    )
     raw_response = send_chat_completion_request_with_retry(base_model, system_prompt, user_prompt,
-                                     temperature=0.0, max_tokens=32,
+                                     temperature=0.0, max_tokens=120,
                                      purpose="verify_answer", logger=logger,
                                      trace_logger=trace_logger)
     label, confidence = "INSUFFICIENT", 0.0
     if raw_response:
-        parts = raw_response.strip().split("|")
-        if parts:
-            label = parts[0].strip().upper()
-        if len(parts) > 1:
+        # Try structured parsing first
+        import re as _re_verify
+        label_match = _re_verify.search(r"Verdict:\s*(SUPPORTS|REFUTES|INSUFFICIENT)", raw_response, _re_verify.IGNORECASE)
+        conf_match = _re_verify.search(r"Confidence:\s*([\d.]+)", raw_response)
+        if label_match:
+            label = label_match.group(1).upper()
+        if conf_match:
             try:
-                confidence = float(parts[1].strip())
+                confidence = float(conf_match.group(1))
             except ValueError:
                 pass
+        # Fallback to legacy pipe-delimited format
+        if not label_match:
+            parts = raw_response.strip().split("|")
+            if parts:
+                first = parts[0].strip().upper()
+                if first in ("SUPPORTS", "REFUTES", "INSUFFICIENT"):
+                    label = first
+            if len(parts) > 1:
+                try:
+                    confidence = float(parts[1].strip())
+                except ValueError:
+                    pass
     return label, confidence
+
+
+def fuse_multi_hop_evidence_via_llm(
+    base_model: dict,
+    question: str,
+    hop_evidence_list: list,
+    logger=None,
+    trace_logger=None,
+) -> str:
+    """Fuse evidence from multiple hops into a coherent summary.
+
+    Why (P0-c, from Research_Agent fuse_hop_evidence): Instead of naively
+    concatenating all hop evidence, we use the LLM to filter noise, resolve
+    contradictions, and produce a focused evidence summary that directly
+    addresses the question.
+    """
+    system_prompt = (
+        "You are an evidence synthesis expert. Given evidence collected from multiple "
+        "search rounds for a complex question, produce a focused evidence summary.\n\n"
+        "Rules:\n"
+        "1. Merge overlapping information, remove duplicates\n"
+        "2. Resolve contradictions by noting both claims with sources\n"
+        "3. Keep EXACT names, dates, numbers — do not paraphrase proper nouns\n"
+        "4. Remove irrelevant information that doesn't help answer the question\n"
+        "5. Output a concise 200-500 word summary of the key facts\n"
+        "6. Preserve the language of the evidence (Chinese stays Chinese, English stays English)\n"
+    )
+    evidence_parts = []
+    for i, hop_ev in enumerate(hop_evidence_list, 1):
+        evidence_parts.append(f"--- Hop {i} Evidence ---\n{hop_ev[:3000]}")
+    user_prompt = (
+        f"Question: {question}\n\n"
+        + "\n\n".join(evidence_parts)
+        + "\n\nSynthesize the key facts into a focused evidence summary:"
+    )
+    return send_chat_completion_request_with_retry(
+        base_model, system_prompt, user_prompt,
+        temperature=0.0, max_tokens=1500,
+        purpose="evidence_fusion",
+        logger=logger, trace_logger=trace_logger,
+    )
 
 
 def arbitrate_among_candidate_answers_via_llm(

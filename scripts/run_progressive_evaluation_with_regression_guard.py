@@ -176,7 +176,7 @@ def print_search_backend_preflight_summary(summary: dict) -> None:
     """Print startup preflight status for each search backend."""
     print("\n[Preflight] Search backend availability check", flush=True)
     engines = summary.get("engines", {}) if isinstance(summary, dict) else {}
-    for engine_name in ("google", "brave", "iqs", "duckduckgo"):
+    for engine_name in ("brightdata", "google", "brave", "iqs", "duckduckgo"):
         info = engines.get(engine_name, {})
         configured = info.get("configured", False)
         enabled = info.get("enabled", False)
@@ -201,6 +201,9 @@ def parse_args():
     parser.add_argument("--question-limit", type=int, default=None, metavar="N",
                         help="Only process the first N questions (e.g. --question-limit 1 for Q0 only). "
                              "Automatically skips staged gates.")
+    parser.add_argument("--random-question", action="store_true", default=False,
+                        help="Randomly select ONE question to test (auto-enables --no-stage). "
+                             "Useful for spot-checking pipeline behavior on diverse question types.")
     return parser.parse_args()
 
 
@@ -224,6 +227,19 @@ def main():
 
     questions = load_questions(QUESTIONS_FILE)
     standard_map = load_standard_map(STANDARD_FILE)
+
+    # Apply random question selection if specified
+    if args.random_question:
+        import random
+        idx = random.randint(0, len(questions) - 1)
+        selected = questions[idx]
+        questions = [selected]
+        args.no_stage = True
+        print(f"[RANDOM] Selected Q{selected.get('id', idx)} (index {idx}/{len(load_questions(QUESTIONS_FILE))})")
+        print(f"[RANDOM] Question: {selected.get('question', '')[:120]}")
+        std_answer = standard_map.get(str(selected.get('id', '')), '')
+        if std_answer:
+            print(f"[RANDOM] Standard answer: {std_answer}")
 
     # Apply question limit if specified
     if args.question_limit is not None:

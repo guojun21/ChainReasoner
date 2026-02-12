@@ -77,6 +77,18 @@
       "env": {
         "BRAVE_API_KEY": "BSAKXNAlEhm9LNuh1fQEiL8AlrCFIO8"
       }
+    },
+    "google-search": {
+      "type": "http",
+      "url": "http://google.ydcloud.org/api/search",
+      "api_key": "VI6o4M-fqBJPjOZqkzI_NOcTjjlN2urDxR9rgcV-1JI",
+      "description": "Google Custom Search proxy — broadest web index for EN and ZH"
+    },
+    "bright-data-serp": {
+      "type": "http",
+      "api_key": "a6bb22a2-e904-41a7-8d2f-4ed4d06a7ab3",
+      "zone": "serp_api1",
+      "description": "Bright Data SERP API — stable Google search via Israeli data platform, $1.50/1K results"
     }
   }
 }

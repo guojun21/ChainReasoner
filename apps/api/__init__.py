@@ -1,1 +1,1 @@
-"""API application package."""
+"""Application entry points package."""

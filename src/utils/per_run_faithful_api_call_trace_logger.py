@@ -44,6 +44,8 @@ class PerRunFaithfulApiCallTraceLogger:
             run_directory / "page_cleaning_trace.jsonl", "w", encoding="utf-8")
         self._answer_voting_trace_file = open(
             run_directory / "answer_voting_trace.jsonl", "w", encoding="utf-8")
+        self._hop_planning_trace_file = open(
+            run_directory / "hop_planning_trace.jsonl", "w", encoding="utf-8")
         self._call_counter = 0
         self._lock = threading.Lock()
 
@@ -262,13 +264,34 @@ class PerRunFaithfulApiCallTraceLogger:
             "decision_reason": decision_reason,
         })
 
+    def record_hop_planning_trace(
+        self,
+        question: str,
+        hop_plan: dict,
+    ) -> None:
+        """Record the structured hop plan for post-mortem analysis.
+
+        Why (P0-c): To understand how the planner decomposed each question
+        and whether the hop targets were appropriate, we record every plan.
+        """
+        self._write_record(self._hop_planning_trace_file, {
+            "timestamp": datetime.now().isoformat(),
+            "call_id": self._next_call_id(),
+            "type": "hop_planning",
+            "question": question[:200],
+            "hop_count": hop_plan.get("hop_count", 0),
+            "hops": hop_plan.get("hops", []),
+            "total_stop_condition": hop_plan.get("total_stop_condition", ""),
+        })
+
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     def close(self) -> None:
         """Flush and close all trace files."""
         for fh in (self._llm_trace_file, self._search_trace_file,
                     self._mcp_trace_file, self._answer_postprocess_trace_file,
-                    self._page_cleaning_trace_file, self._answer_voting_trace_file):
+                    self._page_cleaning_trace_file, self._answer_voting_trace_file,
+                    self._hop_planning_trace_file):
             try:
                 fh.flush()
                 fh.close()

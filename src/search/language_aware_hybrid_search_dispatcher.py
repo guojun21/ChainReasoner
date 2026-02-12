@@ -1,9 +1,15 @@
-"""Language-aware search dispatcher — Chinese to IQS, English to Google/Brave/DDG.
+"""Language-aware search dispatcher — routes queries through multiple engines.
 
-Why: Chinese queries get better results from IQS (Alibaba's index);
-English queries get better results from Google (broadest index), Brave,
-or DuckDuckGo. This multi-engine hybrid approach maximises accuracy
-across both languages in the competition dataset.
+Priority (based on 2026-02-11 benchmark with real competition queries):
+  - EN: BrightData (Google-quality, 5s) -> Brave (fast, 2s) -> DDG -> IQS
+  - ZH: BrightData (Google-quality, 5s) -> IQS (best for ZH but 30s slow)
+        -> Brave -> DDG
+  - Google disabled by default (quota permanently exhausted on free tier)
+
+Why: BrightData returns real Google results via SERP scraping at ~5s with
+10 results, outperforming IQS (30s, 5 results) on speed and matching on
+quality after UTF-8 encoding fix.  IQS remains valuable for Chinese as
+a fallback due to its Baidu-sourced index.
 """
 
 import logging
@@ -13,6 +19,7 @@ from src.search.abstract_search_client_interface import AbstractSearchClientInte
 from src.search.brave_web_search_client import BraveWebSearchClient
 from src.search.alibaba_iqs_search_client import AlibabaIQSSearchClient
 from src.search.google_custom_search_api_client import GoogleCustomSearchApiClient
+from src.search.bright_data_serp_api_client import BrightDataSerpApiClient
 from src.search.duckduckgo_web_search_client import DuckDuckGoWebSearchClient
 from src.search.direct_http_web_page_content_fetcher import enrich_search_results_with_full_page_content
 
@@ -37,24 +44,27 @@ def check_if_text_is_primarily_chinese_characters(text: str, threshold: float = 
 class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
     """Routes queries by language with multi-engine fallback.
 
-    Fallback chain:
-      - Chinese: IQS (primary) -> DuckDuckGo (fallback)
-      - English: Google (primary) -> Brave (fallback) -> DuckDuckGo -> IQS (last resort)
+    Fallback chain (based on 2026-02-11 benchmark):
+      - Chinese: BrightData -> IQS -> Brave -> DDG -> Google (last resort)
+      - English: BrightData -> Brave -> DDG -> IQS -> Google (last resort)
     """
 
     def __init__(self, iqs: Optional[AlibabaIQSSearchClient],
                  brave: Optional[BraveWebSearchClient] = None,
                  google: Optional[GoogleCustomSearchApiClient] = None,
+                 brightdata: Optional[BrightDataSerpApiClient] = None,
                  duckduckgo: Optional[DuckDuckGoWebSearchClient] = None):
         self.iqs = iqs
         self.brave = brave
         self.google = google
+        self.brightdata = brightdata
         self.duckduckgo = duckduckgo
         self.trace_logger = None
         # Engine-level switches used by preflight checks.
         self.engine_enabled = {
             "iqs": bool(iqs),
             "google": bool(google),
+            "brightdata": bool(brightdata),
             "brave": bool(brave),
             "duckduckgo": bool(duckduckgo),
         }
@@ -84,6 +94,11 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
                 "enabled": bool(self.engine_enabled.get("google", False)),
                 "reason": self.engine_disable_reasons.get("google", ""),
             },
+            "brightdata": {
+                "configured": bool(self.brightdata),
+                "enabled": bool(self.engine_enabled.get("brightdata", False)),
+                "reason": self.engine_disable_reasons.get("brightdata", ""),
+            },
             "brave": {
                 "configured": bool(self.brave),
                 "enabled": bool(self.engine_enabled.get("brave", False)),
@@ -103,6 +118,8 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
             return self.iqs is not None
         if engine_name == "google":
             return self.google is not None
+        if engine_name == "brightdata":
+            return self.brightdata is not None
         if engine_name == "brave":
             return self.brave is not None
         if engine_name == "duckduckgo":
@@ -146,61 +163,56 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
         }
 
         if is_chinese:
-            # Chinese: IQS first (best Chinese index), DuckDuckGo fallback
-            if self._is_engine_usable("iqs"):
-                result = self.iqs.execute_search_query(query, meta)
+            # Chinese: BrightData -> IQS -> Brave -> DDG -> Google (last resort)
+            # BrightData first: Google-quality results at 5s (vs IQS 30s)
+            # IQS second: best Chinese index via Baidu, but very slow (20-35s)
+            zh_chain = [
+                ("brightdata", "BrightData"),
+                ("iqs", "IQS"),
+                ("brave", "Brave"),
+                ("duckduckgo", "DDG"),
+                ("google", "Google"),
+            ]
+            for engine_name, display_name in zh_chain:
+                if not self._is_engine_usable(engine_name):
+                    logger.info("%s disabled/unavailable for ZH query: %s", display_name, query[:60])
+                    continue
+                client = getattr(self, engine_name, None)
+                if client is None:
+                    continue
+                result = client.execute_search_query(query, meta)
                 if not result.get("error") and result.get("count", 0) > 0:
-                    return result
+                    # IQS already enriches via readpage; others need page fetching
+                    if engine_name == "iqs":
+                        return result
+                    return self._enrich_non_iqs_results_with_page_content(result)
+                logger.info("%s failed/empty for ZH query, trying next: %s", display_name, query[:60])
                 fallback_result = result
-            else:
-                logger.info("IQS disabled/unavailable, skipping for Chinese query: %s", query[:60])
-            if self._is_engine_usable("google"):
-                logger.info("IQS empty/failed for Chinese query, falling back to Google: %s", query[:60])
-                google_result = self.google.execute_search_query(query, meta)
-                if not google_result.get("error") and google_result.get("count", 0) > 0:
-                    return self._enrich_non_iqs_results_with_page_content(google_result)
-                fallback_result = google_result
-            else:
-                logger.info("Google disabled/unavailable, skipping for Chinese query: %s", query[:60])
-            if self._is_engine_usable("duckduckgo"):
-                logger.info("IQS/Google empty/failed for Chinese query, falling back to DuckDuckGo: %s", query[:60])
-                ddg_result = self.duckduckgo.execute_search_query(query, meta)
-                if not ddg_result.get("error") and ddg_result.get("count", 0) > 0:
-                    return self._enrich_non_iqs_results_with_page_content(ddg_result)
-                fallback_result = ddg_result
-            else:
-                logger.info("DuckDuckGo disabled/unavailable, skipping for Chinese query: %s", query[:60])
             return fallback_result
 
-        # English: Google first (broadest index), Brave fallback, DuckDuckGo, IQS last resort
-        if self._is_engine_usable("google"):
-            result = self.google.execute_search_query(query, meta)
+        # English: BrightData -> Brave -> DDG -> IQS -> Google (last resort)
+        # BrightData first: real Google results, 8-10 results, ~5s
+        # Brave second: fast (2s), 10 results, good EN quality
+        en_chain = [
+            ("brightdata", "BrightData"),
+            ("brave", "Brave"),
+            ("duckduckgo", "DDG"),
+            ("iqs", "IQS"),
+            ("google", "Google"),
+        ]
+        for engine_name, display_name in en_chain:
+            if not self._is_engine_usable(engine_name):
+                logger.info("%s disabled/unavailable for EN query: %s", display_name, query[:60])
+                continue
+            client = getattr(self, engine_name, None)
+            if client is None:
+                continue
+            result = client.execute_search_query(query, meta)
             if not result.get("error") and result.get("count", 0) > 0:
+                if engine_name == "iqs":
+                    return result
                 return self._enrich_non_iqs_results_with_page_content(result)
-            logger.info("Google failed/empty, trying Brave: %s", query[:60])
+            logger.info("%s failed/empty for EN query, trying next: %s", display_name, query[:60])
             fallback_result = result
-        else:
-            logger.info("Google disabled/unavailable, skipping and trying Brave: %s", query[:60])
-
-        if self._is_engine_usable("brave"):
-            result = self.brave.execute_search_query(query, meta)
-            if not result.get("error") and result.get("count", 0) > 0:
-                return self._enrich_non_iqs_results_with_page_content(result)
-            logger.info("Brave failed/empty, trying DuckDuckGo: %s", query[:60])
-            fallback_result = result
-        else:
-            logger.info("Brave disabled/unavailable, skipping and trying DuckDuckGo: %s", query[:60])
-
-        if self._is_engine_usable("duckduckgo"):
-            result = self.duckduckgo.execute_search_query(query, meta)
-            if not result.get("error") and result.get("count", 0) > 0:
-                return self._enrich_non_iqs_results_with_page_content(result)
-            logger.info("DuckDuckGo failed/empty, falling back to IQS: %s", query[:60])
-            fallback_result = result
-        else:
-            logger.info("DuckDuckGo disabled/unavailable, skipping and trying IQS: %s", query[:60])
-
-        if self._is_engine_usable("iqs"):
-            return self.iqs.execute_search_query(query, meta)
         logger.error("No usable search backend for query: %s", query[:80])
         return fallback_result
