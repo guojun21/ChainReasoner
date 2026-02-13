@@ -29,8 +29,11 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-# Maximum retrieval cycles per hop (from everything-claude-code iterative retrieval)
-MAX_RETRIEVAL_CYCLES_PER_HOP = 2
+# Maximum retrieval cycles per hop (from everything-claude-code iterative retrieval).
+# P0-f: Increased from 2 to 3 — two cycles was often insufficient when the
+# first round returned low-quality evidence (especially for multi-hop chains
+# where the first search needs refinement).
+MAX_RETRIEVAL_CYCLES_PER_HOP = 3
 
 
 # ---------------------------------------------------------------------------

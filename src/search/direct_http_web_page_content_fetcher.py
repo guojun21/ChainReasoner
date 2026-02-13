@@ -15,6 +15,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -28,6 +29,31 @@ logger = logging.getLogger(__name__)
 MAX_PAGE_TEXT_LENGTH = 5000  # chars to keep per page
 FETCH_TIMEOUT_SECONDS = 10
 MAX_CONCURRENT_FETCHES = 3
+
+# ── URL blacklist — domains that are known to be useless for content extraction ──
+# Why: These sites either require login (Facebook, LinkedIn, Instagram),
+# return mostly JS-rendered noise (TikTok), contain huge irrelevant datasets
+# (HuggingFace), or are video-only (YouTube).  Attempting to fetch them
+# wastes time and pollutes the LLM context with garbage.
+_URL_BLACKLIST_DOMAINS = frozenset({
+    "facebook.com", "www.facebook.com", "m.facebook.com",
+    "instagram.com", "www.instagram.com",
+    "twitter.com", "www.twitter.com", "x.com", "www.x.com",
+    "linkedin.com", "www.linkedin.com",
+    "tiktok.com", "www.tiktok.com",
+    "huggingface.co", "www.huggingface.co",
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+})
+
+
+def _is_url_blacklisted(url: str) -> bool:
+    """True if the URL's domain is in the blacklist."""
+    try:
+        host = urlparse(url).hostname or ""
+        # Strip leading 'www.' for matching (already in set, but just in case)
+        return host in _URL_BLACKLIST_DOMAINS or host.lstrip("www.") in _URL_BLACKLIST_DOMAINS
+    except Exception:
+        return False
 
 
 def _fetch_and_clean_single_page(
@@ -51,6 +77,9 @@ def _fetch_and_clean_single_page(
     Returns empty string on any error (timeout, 4xx/5xx, encoding issues).
     """
     if not url or not url.startswith("http"):
+        return ""
+    if _is_url_blacklisted(url):
+        logger.debug("Skipping blacklisted URL: %s", url[:80])
         return ""
     try:
         response = requests.get(
@@ -124,10 +153,16 @@ def enrich_search_results_with_full_page_content(
         return results
 
     urls_to_fetch = []
+    skipped_blacklist = 0
     for idx in range(min(top_n, len(results))):
         url = results[idx].get("url", "")
-        if url and url.startswith("http"):
-            urls_to_fetch.append((idx, url))
+        if not url or not url.startswith("http"):
+            continue
+        if _is_url_blacklisted(url):
+            skipped_blacklist += 1
+            logger.info("Skipping blacklisted URL in enrichment: %s", url[:80])
+            continue
+        urls_to_fetch.append((idx, url))
 
     if not urls_to_fetch:
         return results

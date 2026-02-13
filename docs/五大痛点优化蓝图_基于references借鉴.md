@@ -1,8 +1,9 @@
 # ChainReasoner 痛点优化蓝图（基于 references 项目借鉴 + 全量评测数据驱动）
 
-> 当前成绩：27/100（搜索受限）| 基线：33/100 | 目标：55+ | 原则：正确率高于一切，延迟和资源不敏感
+> 当前成绩：27/100（搜索受限）→ Wing 架构改造后待验证 | 基线：33/100 | Wing 对手：42/100 | 目标：70+ | 原则：正确率高于一切，延迟和资源不敏感
 >
 > 最近全量评测：2026-02-11，Google+IQS 不可用，仅 Brave+DuckDuckGo
+> Wing 架构改造：2026-02-13，启用 BrightData + 领域感知路由 + 高跳数(3-5) + 置信度放弃 + 结构化实体传递
 
 ---
 
@@ -10,11 +11,14 @@
 
 | 优先级 | 痛点 | 影响范围 | 状态 | 参考项目 | 核心借鉴 |
 |--------|------|----------|------|---------|---------|
-| **P0** | 多跳推理链断裂 | 29/52 错误（56%） | 部分已做 | Research_Agent, ReAct, open_deep_research, everything-claude-code, analysis_claude_code | 结构化跳数规划 + 中间校验 + 动态查询 + 迭代检索 + 上下文隔离 + 跳目标聚焦提取 |
-| **P0** | 搜索引擎不可用 | Google+IQS 双挂 | 待恢复 | — | 等额度恢复 / 接入替代源（Bright Data, Tavily） |
+| **P0** | 多跳推理链断裂 | 29/52 错误（56%） | ✅ P0-d/e/f + Wing 架构 | Research_Agent, ReAct, Wing | 结构化跳数规划(3-5跳) + 领域感知路由 + 结构化实体传递 + 迭代检索 + 置信度放弃 |
+| **P0** | 搜索引擎不可用 | Google+IQS 双挂 | ✅ BrightData 已启用 | Wing | BrightData SERP API → Google 质量结果，绕过配额限制 |
+| **P0-next** | 知识-搜索仲裁缺失 | Q0 级联偏差 | 🔴 待实施 | — | 知识答案验证搜索 + 双链推理 + 第一跳恢复 |
+| **P0-next** | 答案命名标准化 | Wing 4题格式错 | 🔴 待实施 | — | official name 二次搜索 + 中英文对齐 |
 | **P1** | 格式/语言对齐不足 | 10/52 错误（19%） | 部分已做 | Research_Agent, ReAct | 中英文双输出 + 前缀去除 + 昵称映射 |
 | **P1** | 搜索证据不足 | 13/52 错误（25%） | 部分已做 | crawl4ai, firecrawl | 搜索策略多样化 + 学术/媒体特定源 |
-| **P2** | 验证环节太弱 | 错误答案未拦截 | 待实施 | Enhancing-MH-QA, Research_Agent | self-verification + 证据回查 |
+| **P1-next** | 本地知识库缓存 | 跨题重复搜索 | 🔴 待实施 | bm25s, A-mem | 搜索结果持久化 + BM25 本地检索 + 跨题知识复用 |
+| **P2** | 验证环节太弱 | 错误答案未拦截 | 部分(置信度放弃) | Enhancing-MH-QA, Research_Agent | self-verification + 证据回查 |
 
 ---
 
@@ -25,6 +29,43 @@
 | 答案格式不精确 | 7 步后处理管线 + 格式感知 prompt + 格式提示解析器 |
 | 网页抓取质量差 | 三层清洗管线（规则 + 密度剪枝 + LLM 精炼）+ 域名感知提取器 |
 | LLM 非确定性 | 多候选一致性投票 + Jaccard 相似度聚类 + LLM 仲裁 |
+| **Wing 架构改造** (2026-02-13) | 5 项核心改动，详见下方 Wing 章节 |
+
+### Wing 架构改造详情（2026-02-13）
+
+**背景**：Wing 对手得分 42（我们 27），分析其架构后实施全面改造。
+
+**改动 1: BrightData 搜索引擎启用** ✅
+- `enhanced_multi_hop_api_server.py`: `_build_hybrid_search()` 中初始化 `BrightDataSerpApiClient`
+- preflight 检查中加入 BrightData 探针
+- 效果：Google 质量搜索结果，绕过配额限制，5s 延迟 10 个结果
+
+**改动 2: 领域感知路由** ✅
+- 新建 `src/agents/question_domain_classifier.py`: LLM + 关键词混合分类器
+- 5 个领域: academic / business / government / culture / news
+- `language_aware_hybrid_search_dispatcher.py`: 按 (language, domain) 选不同引擎优先链
+- `constrained_multi_hop_search_agent.py`: 每跳分类领域 → 传入 search meta
+
+**改动 3: 高跳数规划 (3-5 跳)** ✅
+- `structured_multi_hop_reasoning_planner.py`: prompt 改为 3-5 跳示例 + domain 字段
+- hop_count 上限 4 → 5
+- 解析器增加 domain 字段默认值
+
+**改动 4: 置信度驱动放弃** ✅
+- `constrained_multi_hop_search_agent.py`: `_apply_confidence_driven_abstention()` 方法
+- 三条规则: Unknown/refusal → 空; 全候选 Unknown → 空; believe<0.4+无共识 → 空
+- 返回值新增 `believe` 字段
+
+**改动 5: 跨跳结构化实体传递** ✅
+- hop 循环中构建 `structured_hop_results` 列表 (entity + evidence_snippet + confidence)
+- previous_hop_results 改为 entity-highlighted 格式 ("**Entity** — evidence")
+- `_build_isolated_hop_context` 和 `generate_queries_for_hop` 都利用精确实体名
+
+**Q0 Mini 测试观察**:
+- BrightData preflight 通过 ✅
+- 5 跳规划成功生成 (academic→academic→business→business→business) ✅
+- 领域分类工作 ✅
+- 问题: Hop 1 搜索证据将 "元胞自动机" 误导向 "Arduino Esplora" 而非 "RepRap"，知识答案正确但被搜索覆盖
 
 ---
 
@@ -164,10 +205,52 @@ hop_2_query = hop_2.query_template.format(人名=hop_1_result)
   2. **链式级联失败**：Hop 1 无结果 → Hop 2 盲搜 → 错误实体 "Arduino LLC"
   3. **验证发现了真相但无法利用**：`verify_answer` 返回 REFUTES(0.92)，reasoning 指出应为 "RepRapPro Ltd"，但当前逻辑仅回退到备选答案，不提取验证中的正确实体
 
+#### P0-f: REFUTES 实体提取 + 双语查询 + 检索轮次增加（2026-02-13）
+
+**已完成改动（5 项）：**
+
+1. **REFUTES 实体提取**（最高 ROI）：
+   - 新增 `extract_corrected_entity_from_refutation_via_llm()` 函数（`large_language_model_call_handlers.py`）
+   - 修改 `verify_answer_against_evidence_via_llm()` 返回 `(label, confidence, reasoning)` 三元组
+   - 修改 `_run_answer_verification_phase()` 在 REFUTES 时调用提取函数，从 reasoning 中获取正确实体
+   - 注入 `llm_refute_extract_fn` 到 search agent
+
+2. **跨语言双语查询**：
+   - 修改 `generate_queries_for_hop()` prompt 强制要求 `[ZH]` 和 `[EN]` 双语查询
+   - 解析时去除语言标记前缀，上限从 3 → 6（3 ZH + 3 EN）
+   - 主 agent 中每跳查询上限从 `max_queries` 提升到 `max(max_queries, 6)`
+
+3. **检索轮次增加**：`MAX_RETRIEVAL_CYCLES_PER_HOP` 2 → 3
+4. **早停阈值提高**：`confidence >= 0.75` → `0.85`（减少过早终止）
+
+5. **关键修复：注入 llm_generic_fn 和 llm_fuse_fn**：
+   - **发现**：`llm_generic_fn` 和 `llm_fuse_fn` 从未被注入到 search agent！导致 hop planning 退化为默认 1-hop、query generation 无 LLM 参与、evidence fusion 被跳过
+   - **修复**：在 `enhanced_multi_hop_api_server.py` 中注入 `llm_generic_fn → send_chat_completion_request_with_retry` 和 `llm_fuse_fn → fuse_multi_hop_evidence_via_llm`
+   - **影响**：此修复比 P0-f 的三项改动加起来还重要——之前所有的 hop planning/evaluation/refinement 代码都是形同虚设
+
+6. **安装 lxml**：修复多个 `readpage_scrape` 的 "Couldn't find a tree builder" 报错
+
+**P0-f Q0 测试结果（run_20260213_030343）：**
+
+| 指标 | P0-f 之前（run_025502） | P0-f 之后（run_030343） |
+|------|------------------------|------------------------|
+| Hop plan | 1 跳（DEFAULT_HOP_PLAN，无 LLM） | 3 跳（LLM 生成目标） |
+| 查询语言 | 纯中文 | 中文 + 英文双语 |
+| 检索轮次 | 2 轮/跳 | 3 轮/跳 |
+| Evidence fusion | 跳过（llm_fuse_fn=None） | 生效（合并 3 跳证据） |
+| Evaluation/Refine | 跳过 | 生效（多次 refine 查询） |
+| 英文搜索 | 无 | Brave 搜索 RepRap/cellular automaton |
+| 最终答案 | RepRap Ltd（错误） | Ha Engineering... （错误） |
+| 得分 | 0/1 | 0/1 |
+
+**分析**：所有代码架构改动均已验证生效，但 Q0 仍错误。根因是 hop 1 的 LLM 幻觉了错误实体 "Johan Ha"（正确应为 "Adrian Bowyer"），这是因为：
+- IQS 中文搜索 "欧洲学者 开源硬件 元胞自动机" 没命中 RepRap 相关页面
+- LLM 在证据不足时编造了一个不存在的人名
+
 **残余问题 & 下一步：**
-1. 搜索质量（P0 依赖 Google/IQS 恢复或 BrightData 增强英文搜索覆盖）
-2. 验证环节应能从 REFUTES reasoning 中提取正确实体作为修正答案
-3. 中文问题应自动生成英文搜索查询（跨语言多跳），目前中文查询 "开源硬件项目 元胞自动机" 搜不到 RepRap
+1. LLM 幻觉实体的防护（当搜索证据不足时，不应接受 LLM 编造的实体名作为中间结果）
+2. 搜索质量仍为核心瓶颈：Google 不可用，IQS 中文结果与英文话题不匹配
+3. 需要更好的搜索结果评估——当证据完全没提到目标实体时应触发"证据不足"而非填入幻觉
 
 ---
 
@@ -728,23 +811,41 @@ def aggregate_answers(answers: List[str]) -> str:
 
 ## 实施优先级与路线图
 
-### 已完成（Phase 1）
+### 已完成（Phase 1-2）
 1. ✅ **答案后处理管线** — P0 已实施
 2. ✅ **改进 extract_answer prompt** — P0 已实施
 3. ✅ **三层网页清洗管线** — P0-b 已实施
 4. ✅ **多候选一致性投票** — P1-a 已实施
 5. ✅ **域名感知提取器** — P0-b 已实施
 6. ✅ **搜索后端预检+动态降级** — P0-a 已实施
+7. ✅ **结构化多跳规划器 (3-5 跳)** — P0-d + Wing 架构
+8. ✅ **中间结果校验 + 迭代检索** — P0-d/e/f
+9. ✅ **BrightData 搜索引擎** — Wing 架构改动 1
+10. ✅ **领域感知搜索路由** — Wing 架构改动 2
+11. ✅ **置信度驱动放弃机制** — Wing 架构改动 4
+12. ✅ **跨跳结构化实体传递** — Wing 架构改动 5
 
-### Phase 2: 推理层（下一步，预期 +15~25 分）
-7. **结构化多跳规划器** — 借鉴 Research_Agent multi_hop_decomposition（最高优先级！）
-8. **中间结果校验** — 每跳校验 + 失败重试
-9. **格式/语言智能对齐** — 中英文双输出 + 前缀去除 + 昵称映射
-10. **验证环节强化** — 借鉴 Enhancing-MH-QA self_verification
+### Phase 3: 冲击 70 分（下一步，预期 +25~35 分）
 
-### Phase 3: 搜索层（预期 +5~10 分）
-11. **搜索引擎恢复/替代** — Google/IQS 额度恢复，或接入 Bright Data/Tavily
-12. **搜索策略多样化** — 多引擎并行 + 结果合并
-13. **查询感知抓取** — BM25 只保留与 query 相关段落
+**Tier 1: 必须做（预期 +10~15 分）**
 
-### 总计预期：27 分（当前）→ 搜索恢复后 33+ → 推理层优化后 50-65 分
+13. 🔴 **知识-搜索双链仲裁** — knowledge_answer 与搜索答案不一致时，用知识答案做验证搜索，分裂两条推理链并行推进
+14. 🔴 **第一跳错误恢复** — 对比 knowledge_answer 和 hop_1_answer，差异巨大时并行分裂两条链
+15. 🔴 **答案命名标准化** — 找到实体后额外搜 "official name"/"registered name" 确认精确格式
+
+**Tier 2: 高 ROI（预期 +5~8 分）**
+
+16. 🔴 **数值/年份精确验证** — 数字类答案从多源提取后取众数
+17. 🔴 **问题类型格式预判** — 提取前预判答案格式（数字/人名/机构名），格式不匹配强制重提取
+18. 🔴 **本地知识库缓存** — 搜索结果 + 抓取页面持久化到本地 BM25 索引，跨题复用
+    - 实现方案：搜索结果/页面内容存为 JSONL，每轮运行前加载已有数据
+    - 同题 100 道之间有信息复用潜力（同领域问题搜索重叠）
+    - 预期节省 30-50% 搜索调用，同时减少 BrightData 成本
+
+**Tier 3: 锦上添花（预期 +3~5 分）**
+
+19. 🔴 **Wikipedia 直达检索** — 人名/地名/机构名直接抓 Wikipedia 页面做精确提取
+20. 🔴 **并行模型投票** — 多温度/seed 生成候选答案
+21. 🔴 **答案后处理 pipeline 强化** — 中英文名对齐、格式约束执行
+
+### 总计预期路线：27 分（旧）→ Wing 架构 ~42 分 → Tier 1 完成 ~55 分 → Tier 2 完成 ~65 分 → Tier 3 完成 70+ 分

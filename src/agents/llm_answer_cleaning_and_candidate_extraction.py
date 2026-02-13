@@ -146,9 +146,18 @@ def select_highest_frequency_candidate_as_answer(question: str, candidates: Dict
 
 
 def verify_answer_against_evidence_using_llm(question: str, answer: str, evidence_text: str,
-                  llm_verify_fn: Optional[Callable] = None) -> bool:
-    """Ask the LLM to confirm or refute an answer against evidence."""
+                  llm_verify_fn: Optional[Callable] = None) -> Tuple[bool, str, str, float]:
+    """Ask the LLM to confirm or refute an answer against evidence.
+
+    Returns:
+        (is_valid, verdict_label, reasoning, confidence).
+        is_valid is True only when verdict is SUPPORTS with confidence >= 0.5.
+        verdict_label is one of SUPPORTS/REFUTES/INSUFFICIENT.
+        reasoning contains the verification reasoning text (useful for
+        extracting correct entities when REFUTES).
+    """
     if not llm_verify_fn:
-        return True
-    label, confidence = llm_verify_fn(question, answer, evidence_text)
-    return label == "SUPPORTS" and confidence >= 0.5
+        return True, "SUPPORTS", "", 1.0
+    label, confidence, reasoning = llm_verify_fn(question, answer, evidence_text)
+    is_valid = label == "SUPPORTS" and confidence >= 0.5
+    return is_valid, label, reasoning, confidence

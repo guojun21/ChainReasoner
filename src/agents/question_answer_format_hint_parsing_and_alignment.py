@@ -142,7 +142,33 @@ def align_answer_text_to_format_hint_with_conservative_rules(
         number_match = re.search(r"\d{4}" if parsed_hint.expected_answer_style == "year_only" else r"\d+", cleaned_text)
         if number_match:
             return number_match.group(0)
+    # Why: Most official company names use abbreviations (Ltd, Corp, Inc) in
+    # their registered names.  LLMs often expand these to full words (Limited,
+    # Corporation, Incorporated) but exact-match scoring expects the official
+    # abbreviated form.  This mapping covers the most common cases.
+    if parsed_hint.expected_answer_style == "english_company_name":
+        cleaned_text = _normalize_company_name_abbreviations(cleaned_text)
     return cleaned_text
+
+
+def _normalize_company_name_abbreviations(name: str) -> str:
+    """Normalize common company-name suffixes to their standard abbreviations.
+
+    Why: Company registrations overwhelmingly use abbreviated forms (Ltd, Corp,
+    Inc) but LLMs often expand them.  Exact-match scoring demands the official
+    form.  We map full words → abbreviations since abbreviations are far more
+    common in official company names and web sources.
+    """
+    # Order matters: process longer patterns first to avoid partial matches
+    _COMPANY_ABBREV_MAP = [
+        (r"\bLimited\b", "Ltd"),
+        (r"\bCorporation\b", "Corp"),
+        (r"\bIncorporated\b", "Inc"),
+        (r"\bCompany\b", "Co"),
+    ]
+    for pattern, replacement in _COMPANY_ABBREV_MAP:
+        name = re.sub(pattern, replacement, name)
+    return name
 
 
 # ── Format-aware answer post-processing pipeline ───────────────────────

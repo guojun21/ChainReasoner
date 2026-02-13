@@ -32,6 +32,7 @@ from src.search.google_custom_search_api_client import GoogleCustomSearchApiClie
 from src.search.duckduckgo_web_search_client import DuckDuckGoWebSearchClient
 from src.search.language_aware_hybrid_search_dispatcher import LanguageAwareHybridSearchDispatcher
 from src.search.alibaba_iqs_search_client import AlibabaIQSSearchClient
+from src.search.bright_data_serp_api_client import BrightDataSerpApiClient
 
 from apps.api.large_language_model_call_handlers import (
     send_chat_completion_request_with_retry,
@@ -40,6 +41,8 @@ from apps.api.large_language_model_call_handlers import (
     decompose_multi_hop_question_into_search_queries,
     extract_concise_answer_from_evidence_using_llm,
     verify_answer_against_evidence_via_llm,
+    fuse_multi_hop_evidence_via_llm,
+    extract_corrected_entity_from_refutation_via_llm,
     arbitrate_among_candidate_answers_via_llm,
 )
 from src.agents.question_answer_format_hint_parsing_and_alignment import (
@@ -201,9 +204,23 @@ class EnhancedMultiHopReasoningApiServer:
             llm_knowledge_fn=lambda q: get_knowledge_only_answer_from_llm(
                 self.base_model, q, self.logger, trace_logger=self.trace_logger),
         )
+        # Inject LLM generic function (used by hop planner + query generation)
+        # Why: Without this, generate_structured_multi_hop_plan and
+        # generate_queries_for_hop fall back to trivial defaults (1-hop, no LLM queries).
+        self.search_agent.llm_generic_fn = lambda sys_p, usr_p: send_chat_completion_request_with_retry(
+            self.base_model, sys_p, usr_p,
+            temperature=0.0, max_tokens=1500,
+            purpose="generic_hop_planning", logger=self.logger,
+            trace_logger=self.trace_logger)
+        # Inject LLM evidence fusion function (for multi-hop evidence merging)
+        self.search_agent.llm_fuse_fn = lambda q, ev_list: fuse_multi_hop_evidence_via_llm(
+            self.base_model, q, ev_list, self.logger, trace_logger=self.trace_logger)
         # P1-a: Inject LLM arbitration function + trace logger into search agent
         self.search_agent.llm_arbitrate_fn = lambda sys_p, usr_p: arbitrate_among_candidate_answers_via_llm(
             self.base_model, sys_p, usr_p, self.logger, trace_logger=self.trace_logger)
+        # P0-f: Inject REFUTES entity extraction function
+        self.search_agent.llm_refute_extract_fn = lambda q, reasoning: extract_corrected_entity_from_refutation_via_llm(
+            self.base_model, q, reasoning, self.logger, trace_logger=self.trace_logger)
         self.search_agent.trace_logger = self.trace_logger
         self.app = Flask(__name__)
         self._setup_routes()
@@ -304,23 +321,32 @@ class EnhancedMultiHopReasoningApiServer:
         return raw_text
 
     def _build_hybrid_search(self) -> LanguageAwareHybridSearchDispatcher:
-        """Wire IQS + Google + Brave + DuckDuckGo into LanguageAwareHybridSearchDispatcher."""
+        """Wire IQS + Google + Brave + DuckDuckGo + BrightData into dispatcher.
+
+        Wing-architecture: BrightData provides Google-quality results via SERP
+        scraping, bypassing quota limits.  It becomes the primary search engine
+        for both EN and ZH queries.
+        """
         iqs = AlibabaIQSSearchClient.from_mcp_config(self.mcp_config)
         google = GoogleCustomSearchApiClient.from_mcp_config(self.mcp_config)
         brave = BraveWebSearchClient.from_mcp_config(self.mcp_config) or BraveWebSearchClient.from_config(self.config)
         duckduckgo = DuckDuckGoWebSearchClient(timeout=15)
+        brightdata = BrightDataSerpApiClient.from_mcp_config(self.mcp_config)
         engines = []
+        if brightdata:
+            engines.append("BrightData")
         if google:
             engines.append("Google")
         if brave:
             engines.append("Brave")
         engines.append("DuckDuckGo")
         engines.append("IQS")
-        self.logger.info("Hybrid mode: EN -> %s, ZH -> IQS -> %s",
+        self.logger.info("Hybrid mode: EN -> %s, ZH -> %s",
                          " -> ".join(engines),
-                         " -> ".join([e for e in engines if e != "IQS"]))
+                         " -> ".join(engines))
         return LanguageAwareHybridSearchDispatcher(
-            iqs=iqs, brave=brave, google=google, duckduckgo=duckduckgo)
+            iqs=iqs, brave=brave, google=google,
+            brightdata=brightdata, duckduckgo=duckduckgo)
 
     def _hybrid_search_fn(self, query: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Primary search dispatch — routes through LanguageAwareHybridSearchDispatcher."""
@@ -343,6 +369,7 @@ class EnhancedMultiHopReasoningApiServer:
 
         self.logger.info("Search backend preflight: starting")
         checks = [
+            ("brightdata", "RepRap open source hardware"),
             ("google", "test query"),
             ("brave", "open source hardware project"),
             ("iqs", "北京 天气"),
@@ -408,7 +435,7 @@ class EnhancedMultiHopReasoningApiServer:
         summary = {"status": "ok", "engines": engines, "snapshot": snapshot}
         self._last_search_backend_preflight = summary
 
-        for name in ("google", "brave", "iqs", "duckduckgo"):
+        for name in ("brightdata", "google", "brave", "iqs", "duckduckgo"):
             info = engines.get(name, {})
             self.logger.info(
                 "Preflight %-10s configured=%s enabled=%s status=%s reason=%s",

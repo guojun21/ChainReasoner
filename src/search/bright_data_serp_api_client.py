@@ -28,6 +28,13 @@ logger = logging.getLogger(__name__)
 BRIGHT_DATA_SERP_API_URL = "https://api.brightdata.com/request"
 BRIGHT_DATA_UNAVAILABLE_ERROR_CODE = "BRIGHTDATA_UNAVAILABLE"
 
+# Retry configuration — BrightData proxy nodes are intermittently unstable
+# (HTTP 500 ECONNREFUSED, 504 Gateway Timeout).  Retrying with backoff
+# recovers most transient failures without falling back to lower-quality engines.
+_RETRYABLE_STATUS_CODES = frozenset({500, 502, 503, 504})
+_MAX_RETRIES = 2
+_RETRY_BACKOFF_BASE = 2  # seconds: wait 2s, then 4s
+
 # ---------- Markdown SERP parser ----------
 
 # Pattern: markdown link with title and URL, followed by description text
@@ -168,7 +175,14 @@ class BrightDataSerpApiClient(AbstractSearchClientInterface):
     """
 
     def __init__(self, api_key: str, zone: str = "serp_api1",
-                 country: str = "", count: int = 10, timeout: int = 45):
+                 country: str = "", count: int = 10, timeout: int = 20):
+        """Initialize BrightData SERP API client.
+
+        Why timeout=20: BrightData normally responds in 3-8s.  The old 45s
+        default wasted up to 45s per failed attempt before falling back.
+        20s gives ample room for slow responses while failing fast on dead
+        proxy nodes.
+        """
         self.api_key = api_key
         self.zone = zone
         self.country = country
@@ -195,11 +209,19 @@ class BrightDataSerpApiClient(AbstractSearchClientInterface):
 
         Uses format='raw' to get Google SERP as markdown, then parses
         the markdown to extract structured search results.
+
+        Why retry: BrightData proxy nodes are intermittently unstable — a
+        single 500/504 does not mean the service is down.  Retrying 2 times
+        with exponential backoff (2s, 4s) recovers most transient failures
+        and avoids falling back to lower-quality engines like Brave.
         """
         start_time = time.time()
         logger.info("BrightData SERP search: query=%s", query[:80])
 
-        google_url = f"https://www.google.com/search?q={requests.utils.quote(query)}&num={self.count}"
+        # Note: BrightData strips Google's &num= parameter (logged as warning:
+        # "these query parameters have unacceptable name and/or value and were
+        # removed: num").  Google SERP via BrightData always returns ~10 results.
+        google_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
 
         payload: Dict[str, Any] = {
             "zone": self.zone,
@@ -214,44 +236,81 @@ class BrightDataSerpApiClient(AbstractSearchClientInterface):
             "Content-Type": "application/json",
         }
 
-        try:
-            response = requests.post(
-                BRIGHT_DATA_SERP_API_URL,
-                headers=headers,
-                json=payload,
-                timeout=self.timeout,
-            )
+        last_error = ""
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                response = requests.post(
+                    BRIGHT_DATA_SERP_API_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout,
+                )
 
-            if response.status_code == 401:
-                logger.warning("BrightData SERP: authentication failed (401)")
-                return self._error_result(query, "auth_failed", start_time)
+                # Non-retryable client errors — fail immediately
+                if response.status_code == 401:
+                    logger.warning("BrightData SERP: authentication failed (401)")
+                    return self._error_result(query, "auth_failed", start_time)
 
-            if response.status_code == 403:
-                logger.warning("BrightData SERP: forbidden (403)")
-                return self._error_result(query, "forbidden", start_time)
+                if response.status_code == 403:
+                    logger.warning("BrightData SERP: forbidden (403)")
+                    return self._error_result(query, "forbidden", start_time)
 
-            if response.status_code == 429:
-                logger.warning("BrightData SERP: rate limited (429)")
-                return self._error_result(query, "rate_limited", start_time)
+                if response.status_code == 429:
+                    logger.warning("BrightData SERP: rate limited (429)")
+                    return self._error_result(query, "rate_limited", start_time)
 
-            if response.status_code >= 400:
-                logger.warning("BrightData SERP: HTTP %d — %s",
-                               response.status_code, response.text[:200])
-                return self._error_result(query, f"http_{response.status_code}", start_time)
+                # Retryable server errors — retry with backoff
+                if response.status_code in _RETRYABLE_STATUS_CODES:
+                    last_error = f"http_{response.status_code}"
+                    if attempt < _MAX_RETRIES:
+                        wait = _RETRY_BACKOFF_BASE * (2 ** attempt)
+                        logger.warning(
+                            "BrightData SERP: HTTP %d, retry %d/%d in %ds — %s",
+                            response.status_code, attempt + 1, _MAX_RETRIES,
+                            wait, response.text[:100])
+                        time.sleep(wait)
+                        continue
+                    logger.warning("BrightData SERP: HTTP %d after %d retries — %s",
+                                   response.status_code, _MAX_RETRIES,
+                                   response.text[:200])
+                    return self._error_result(query, last_error, start_time)
 
-            # Response is markdown text (format=raw).
-            # Bright Data returns Content-Type: text/markdown without charset,
-            # causing requests to default to ISO-8859-1.  Force UTF-8 decoding
-            # since Google SERP pages are always UTF-8.
-            response.encoding = "utf-8"
-            markdown_text = response.text
+                # Other 4xx errors — fail immediately
+                if response.status_code >= 400:
+                    logger.warning("BrightData SERP: HTTP %d — %s",
+                                   response.status_code, response.text[:200])
+                    return self._error_result(query, f"http_{response.status_code}", start_time)
 
-        except requests.exceptions.Timeout:
-            logger.error("BrightData SERP: timeout after %ds", self.timeout)
-            return self._error_result(query, "timeout", start_time)
-        except requests.exceptions.RequestException as exc:
-            logger.error("BrightData SERP: request error: %s", exc)
-            return self._error_result(query, str(exc), start_time)
+                # Success — decode and break out of retry loop
+                response.encoding = "utf-8"
+                markdown_text = response.text
+                break
+
+            except requests.exceptions.Timeout:
+                last_error = "timeout"
+                if attempt < _MAX_RETRIES:
+                    wait = _RETRY_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning("BrightData SERP: timeout, retry %d/%d in %ds",
+                                   attempt + 1, _MAX_RETRIES, wait)
+                    time.sleep(wait)
+                    continue
+                logger.error("BrightData SERP: timeout after %d retries", _MAX_RETRIES)
+                return self._error_result(query, "timeout", start_time)
+
+            except requests.exceptions.RequestException as exc:
+                last_error = str(exc)
+                if attempt < _MAX_RETRIES:
+                    wait = _RETRY_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning("BrightData SERP: error %s, retry %d/%d in %ds",
+                                   exc, attempt + 1, _MAX_RETRIES, wait)
+                    time.sleep(wait)
+                    continue
+                logger.error("BrightData SERP: request error after %d retries: %s",
+                             _MAX_RETRIES, exc)
+                return self._error_result(query, last_error, start_time)
+        else:
+            # Should not reach here, but safety fallback
+            return self._error_result(query, last_error or "unknown", start_time)
 
         results = _parse_google_serp_markdown_into_results(markdown_text)
         elapsed_ms = int((time.time() - start_time) * 1000)

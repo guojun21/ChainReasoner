@@ -10,10 +10,18 @@ Why: BrightData returns real Google results via SERP scraping at ~5s with
 10 results, outperforming IQS (30s, 5 results) on speed and matching on
 quality after UTF-8 encoding fix.  IQS remains valuable for Chinese as
 a fallback due to its Baidu-sourced index.
+
+Runtime fail-streak tracking: If an engine fails N consecutive times in a
+single run, the dispatcher skips it for subsequent queries to avoid wasting
+time on a dead backend (e.g. BrightData proxy node down for the entire run).
 """
 
 import logging
 from typing import Any, Dict, Optional
+
+# After this many consecutive failures in a single run, the dispatcher
+# automatically skips the engine for subsequent queries.
+_MAX_FAIL_STREAK = 3
 
 from src.search.abstract_search_client_interface import AbstractSearchClientInterface
 from src.search.brave_web_search_client import BraveWebSearchClient
@@ -60,6 +68,9 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
         self.brightdata = brightdata
         self.duckduckgo = duckduckgo
         self.trace_logger = None
+        # Runtime fail-streak counter — tracks consecutive failures per engine
+        # within a single run.  Reset on success; engine auto-skipped at threshold.
+        self._engine_fail_streak: Dict[str, int] = {}
         # Engine-level switches used by preflight checks.
         self.engine_enabled = {
             "iqs": bool(iqs),
@@ -114,6 +125,12 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
     def _is_engine_usable(self, engine_name: str) -> bool:
         if not self.engine_enabled.get(engine_name, False):
             return False
+        # Fast-skip engines that have failed too many times in this run
+        streak = self._engine_fail_streak.get(engine_name, 0)
+        if streak >= _MAX_FAIL_STREAK:
+            logger.info("Skipping %s — %d consecutive failures in this run",
+                        engine_name, streak)
+            return False
         if engine_name == "iqs":
             return self.iqs is not None
         if engine_name == "google":
@@ -125,6 +142,21 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
         if engine_name == "duckduckgo":
             return self.duckduckgo is not None
         return False
+
+    def _record_engine_success(self, engine_name: str) -> None:
+        """Reset fail streak on success."""
+        self._engine_fail_streak[engine_name] = 0
+
+    def _record_engine_failure(self, engine_name: str) -> None:
+        """Increment fail streak; log warning at threshold."""
+        self._engine_fail_streak[engine_name] = (
+            self._engine_fail_streak.get(engine_name, 0) + 1
+        )
+        streak = self._engine_fail_streak[engine_name]
+        if streak == _MAX_FAIL_STREAK:
+            logger.warning(
+                "Engine %s hit %d consecutive failures — auto-skipping for "
+                "remaining queries in this run", engine_name, streak)
 
     def _enrich_non_iqs_results_with_page_content(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch full page text for top search results from non-IQS engines.
@@ -152,8 +184,85 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
             )
         return result
 
+    # ── Domain-aware engine priority chains (Wing architecture) ──────
+    # Each (language, domain) combination gets a tuned engine priority.
+    # BrightData is always first (Google-quality); the fallback order changes
+    # based on what type of content is most likely to be found where.
+
+    _DOMAIN_ENGINE_CHAINS: Dict[str, list] = {
+        # Academic: BrightData (Google Scholar) -> Brave -> DDG -> IQS -> Google
+        "academic": [
+            ("brightdata", "BrightData"), ("brave", "Brave"),
+            ("duckduckgo", "DDG"), ("iqs", "IQS"), ("google", "Google"),
+        ],
+        # Business: BrightData -> Brave -> DDG -> IQS -> Google
+        "business": [
+            ("brightdata", "BrightData"), ("brave", "Brave"),
+            ("duckduckgo", "DDG"), ("iqs", "IQS"), ("google", "Google"),
+        ],
+        # Government ZH: IQS (Chinese official data) -> BrightData -> Brave -> DDG
+        "government_zh": [
+            ("iqs", "IQS"), ("brightdata", "BrightData"),
+            ("brave", "Brave"), ("duckduckgo", "DDG"), ("google", "Google"),
+        ],
+        # Government EN: BrightData -> Brave -> DDG -> IQS -> Google
+        "government_en": [
+            ("brightdata", "BrightData"), ("brave", "Brave"),
+            ("duckduckgo", "DDG"), ("iqs", "IQS"), ("google", "Google"),
+        ],
+        # Culture: BrightData -> Brave (encyclopedic) -> DDG -> IQS -> Google
+        "culture": [
+            ("brightdata", "BrightData"), ("brave", "Brave"),
+            ("duckduckgo", "DDG"), ("iqs", "IQS"), ("google", "Google"),
+        ],
+        # News: BrightData -> Brave (news) -> DDG -> IQS -> Google
+        "news": [
+            ("brightdata", "BrightData"), ("brave", "Brave"),
+            ("duckduckgo", "DDG"), ("iqs", "IQS"), ("google", "Google"),
+        ],
+    }
+
+    # Default chains when no domain is specified
+    _DEFAULT_ZH_CHAIN = [
+        ("brightdata", "BrightData"), ("iqs", "IQS"),
+        ("brave", "Brave"), ("duckduckgo", "DDG"), ("google", "Google"),
+    ]
+    _DEFAULT_EN_CHAIN = [
+        ("brightdata", "BrightData"), ("brave", "Brave"),
+        ("duckduckgo", "DDG"), ("iqs", "IQS"), ("google", "Google"),
+    ]
+
+    def _resolve_engine_chain(self, is_chinese: bool, domain: str) -> list:
+        """Pick the engine priority chain based on language + domain.
+
+        Wing-architecture: domain-aware routing selects different search engine
+        priorities so that government/ZH queries prefer IQS (Baidu index) while
+        academic/business queries prefer BrightData (Google index).
+        """
+        if domain:
+            if domain == "government" and is_chinese:
+                chain = self._DOMAIN_ENGINE_CHAINS.get("government_zh")
+            elif domain == "government":
+                chain = self._DOMAIN_ENGINE_CHAINS.get("government_en")
+            else:
+                chain = self._DOMAIN_ENGINE_CHAINS.get(domain)
+            if chain:
+                return chain
+        return self._DEFAULT_ZH_CHAIN if is_chinese else self._DEFAULT_EN_CHAIN
+
     def execute_search_query(self, query: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Execute search with domain-aware engine routing.
+
+        Wing-architecture: reads ``meta["domain"]`` to pick the best engine
+        priority chain for the question type (academic/business/government/
+        culture/news).  Falls back to language-based default chain.
+        """
+        meta = meta or {}
         is_chinese = check_if_text_is_primarily_chinese_characters(query)
+        domain = meta.get("domain", "")
+        engine_chain = self._resolve_engine_chain(is_chinese, domain)
+        lang_tag = "ZH" if is_chinese else "EN"
+
         fallback_result = {
             "service": "hybrid-dispatcher",
             "query": query,
@@ -162,57 +271,25 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
             "error": "no_search_backend_available",
         }
 
-        if is_chinese:
-            # Chinese: BrightData -> IQS -> Brave -> DDG -> Google (last resort)
-            # BrightData first: Google-quality results at 5s (vs IQS 30s)
-            # IQS second: best Chinese index via Baidu, but very slow (20-35s)
-            zh_chain = [
-                ("brightdata", "BrightData"),
-                ("iqs", "IQS"),
-                ("brave", "Brave"),
-                ("duckduckgo", "DDG"),
-                ("google", "Google"),
-            ]
-            for engine_name, display_name in zh_chain:
-                if not self._is_engine_usable(engine_name):
-                    logger.info("%s disabled/unavailable for ZH query: %s", display_name, query[:60])
-                    continue
-                client = getattr(self, engine_name, None)
-                if client is None:
-                    continue
-                result = client.execute_search_query(query, meta)
-                if not result.get("error") and result.get("count", 0) > 0:
-                    # IQS already enriches via readpage; others need page fetching
-                    if engine_name == "iqs":
-                        return result
-                    return self._enrich_non_iqs_results_with_page_content(result)
-                logger.info("%s failed/empty for ZH query, trying next: %s", display_name, query[:60])
-                fallback_result = result
-            return fallback_result
-
-        # English: BrightData -> Brave -> DDG -> IQS -> Google (last resort)
-        # BrightData first: real Google results, 8-10 results, ~5s
-        # Brave second: fast (2s), 10 results, good EN quality
-        en_chain = [
-            ("brightdata", "BrightData"),
-            ("brave", "Brave"),
-            ("duckduckgo", "DDG"),
-            ("iqs", "IQS"),
-            ("google", "Google"),
-        ]
-        for engine_name, display_name in en_chain:
+        for engine_name, display_name in engine_chain:
             if not self._is_engine_usable(engine_name):
-                logger.info("%s disabled/unavailable for EN query: %s", display_name, query[:60])
+                logger.info("%s disabled/unavailable for %s/%s query: %s",
+                            display_name, lang_tag, domain or "default", query[:60])
                 continue
             client = getattr(self, engine_name, None)
             if client is None:
                 continue
             result = client.execute_search_query(query, meta)
             if not result.get("error") and result.get("count", 0) > 0:
+                self._record_engine_success(engine_name)
                 if engine_name == "iqs":
                     return result
                 return self._enrich_non_iqs_results_with_page_content(result)
-            logger.info("%s failed/empty for EN query, trying next: %s", display_name, query[:60])
+            self._record_engine_failure(engine_name)
+            logger.info("%s failed/empty for %s/%s query, trying next: %s",
+                        display_name, lang_tag, domain or "default", query[:60])
             fallback_result = result
-        logger.error("No usable search backend for query: %s", query[:80])
+
+        logger.error("No usable search backend for %s/%s query: %s",
+                     lang_tag, domain or "default", query[:80])
         return fallback_result

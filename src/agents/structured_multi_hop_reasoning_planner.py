@@ -65,19 +65,44 @@ def generate_structured_multi_hop_plan(
 
     system_prompt = (
         "你是一个多跳推理规划专家。给定一个复杂问题，你需要分析它的推理链并输出结构化的多跳计划。\n\n"
+        "## 核心原则（Wing 高分架构）\n"
+        "- 每个独立线索拆成一个独立的 hop（不要合并多个线索到一跳）\n"
+        "- 大多数竞赛题需要 3-5 跳（平均 4 跳）\n"
+        "- 每跳的 target 必须是可搜索的具体实体/事实，不能是泛化描述\n"
+        "- 每跳增加 domain 字段（从 5 个领域中选 1 个）\n\n"
         "## 规则\n"
-        "1. 判断问题需要几跳推理（1跳、2跳、或3跳）\n"
-        "2. 每跳必须有明确的搜索目标(target)和终止条件(stop_condition)\n"
-        "3. 后跳的target应依赖前跳的结果\n"
+        "1. 判断问题需要几跳推理（通常 3-5 跳，简单问题至少 2 跳）\n"
+        "2. 每跳必须有明确的搜索目标(target)、终止条件(stop_condition)和领域(domain)\n"
+        "3. 后跳的 target 应依赖前跳的结果\n"
         "4. 对于反推类问题（由结果推原因），按逆序拆解\n"
-        "5. 中文问题用中文描述target，英文问题用英文描述target\n\n"
+        "5. 中文问题用中文描述target，英文问题用英文描述target\n"
+        "6. domain 必须是以下 5 个之一: academic, business, government, culture, news\n\n"
         "## 输出格式（严格JSON，无任何额外文本）\n"
-        '{"hop_count": 数字, "hops": [{"hop_num": 1, "target": "搜索目标", "stop_condition": "获取到X信息即停止"}, ...], "total_stop_condition": "获取到完整答案"}\n\n'
-        "## 示例\n"
-        '问题: "一位欧洲学者创立的开源硬件商业实体的英文名称"\n'
-        '输出: {"hop_count": 3, "hops": [{"hop_num": 1, "target": "找到该开源硬件项目名称和创始学者", "stop_condition": "获取到项目名和学者名"}, {"hop_num": 2, "target": "找到该学者创立的商业实体", "stop_condition": "获取到公司名"}, {"hop_num": 3, "target": "确认该公司在欧洲停止交易但亚洲业务延续的细节", "stop_condition": "获取到公司英文全称"}], "total_stop_condition": "获取到商业实体的完整英文名称"}\n\n'
+        '{"hop_count": 数字, "hops": [{"hop_num": 1, "target": "搜索目标", "stop_condition": "获取到X信息即停止", "domain": "academic"}, ...], "total_stop_condition": "获取到完整答案"}\n\n'
+        "## 示例 1（5 跳复杂题）\n"
+        '问题: "一位欧洲学者创立的开源硬件商业实体在亚洲保留了运营但在欧洲停止了交易，该实体的英文名称是什么？"\n'
+        '输出: {"hop_count": 5, "hops": ['
+        '{"hop_num": 1, "target": "找到知名的开源硬件项目（如 RepRap、Arduino）", "stop_condition": "获取到项目名称列表", "domain": "academic"}, '
+        '{"hop_num": 2, "target": "确认哪个开源硬件项目由欧洲学者创立", "stop_condition": "获取到学者姓名和国籍", "domain": "academic"}, '
+        '{"hop_num": 3, "target": "搜索该学者创立的商业实体/公司", "stop_condition": "获取到公司名", "domain": "business"}, '
+        '{"hop_num": 4, "target": "验证该公司是否在欧洲停止交易", "stop_condition": "确认欧洲业务状态", "domain": "business"}, '
+        '{"hop_num": 5, "target": "确认亚洲业务运营情况和公司英文全称", "stop_condition": "获取到公司英文全称", "domain": "business"}'
+        '], "total_stop_condition": "获取到商业实体的完整英文名称"}\n\n'
+        "## 示例 2（3 跳中等题）\n"
         '问题: "Who is the author of article X in journal Y?"\n'
-        '输出: {"hop_count": 2, "hops": [{"hop_num": 1, "target": "Find article X in journal Y", "stop_condition": "Found the specific article"}, {"hop_num": 2, "target": "Identify the author of that article", "stop_condition": "Found author name"}], "total_stop_condition": "Get the full author name"}'
+        '输出: {"hop_count": 3, "hops": ['
+        '{"hop_num": 1, "target": "Find journal Y and its publication database", "stop_condition": "Found journal Y homepage or database", "domain": "academic"}, '
+        '{"hop_num": 2, "target": "Search for article X within journal Y", "stop_condition": "Found the specific article listing", "domain": "academic"}, '
+        '{"hop_num": 3, "target": "Identify the author(s) of article X", "stop_condition": "Found author name(s)", "domain": "academic"}'
+        '], "total_stop_condition": "Get the full author name"}\n\n'
+        "## 示例 3（4 跳文化题）\n"
+        '问题: "2024年奥斯卡最佳影片的导演之前执导的第一部剧情片叫什么名字？"\n'
+        '输出: {"hop_count": 4, "hops": ['
+        '{"hop_num": 1, "target": "查询2024年奥斯卡最佳影片获奖名单", "stop_condition": "获取到获奖影片名称", "domain": "culture"}, '
+        '{"hop_num": 2, "target": "查找该影片的导演姓名", "stop_condition": "获取到导演名", "domain": "culture"}, '
+        '{"hop_num": 3, "target": "搜索该导演的完整作品列表", "stop_condition": "获取到按时间排序的作品列表", "domain": "culture"}, '
+        '{"hop_num": 4, "target": "确认该导演执导的第一部剧情片名称", "stop_condition": "获取到第一部剧情片名", "domain": "culture"}'
+        '], "total_stop_condition": "获取到导演第一部剧情片的名称"}'
     )
     user_prompt = f"问题: {question}\n\n输出JSON多跳计划:"
 
@@ -134,13 +159,14 @@ def _parse_hop_plan_json(raw: str, question: str) -> Dict[str, Any]:
             hop_count = 2
         else:
             hop_count = 1
-    plan["hop_count"] = min(int(hop_count), 4)  # Cap at 4 hops
+    plan["hop_count"] = min(int(hop_count), 5)  # Wing-architecture: cap at 5 hops
 
-    # Ensure each hop has required fields
+    # Ensure each hop has required fields (including Wing-architecture domain)
     for hop in plan["hops"]:
         hop.setdefault("target", "搜索相关信息")
         hop.setdefault("stop_condition", "获取到相关信息")
         hop.setdefault("hop_num", plan["hops"].index(hop) + 1)
+        hop.setdefault("domain", "")  # Wing-architecture: domain for search routing
 
     plan.setdefault("total_stop_condition", "获取到完整答案")
     return plan
@@ -238,23 +264,30 @@ def generate_queries_for_hop(
 
     prev_context = ""
     if previous_hop_results:
-        prev_context = "Previous research findings:\n" + "\n".join(
-            f"- Hop {i+1}: {r[:300]}" for i, r in enumerate(previous_hop_results)
-        ) + "\n\n"
+        # Wing-architecture: previous_hop_results now contain entity-highlighted
+        # summaries (e.g. "Hop 1 (target): **Entity** — evidence").  We surface
+        # entities prominently so the LLM uses exact names in new queries.
+        prev_context = "Previous research findings (entities in **bold**):\n" + "\n".join(
+            f"- {r[:400]}" for r in previous_hop_results
+        ) + "\n\nUse the exact entity names found above in your new search queries.\n\n"
 
     system_prompt = (
-        "Generate 2-3 precise search queries for a specific research objective.\n"
+        "Generate precise search queries for a specific research objective.\n"
         "Rules:\n"
+        "- Generate 2-3 CHINESE queries AND 2-3 ENGLISH queries (both are required!)\n"
         "- Each query should be 5-20 words\n"
         "- Include specific names, dates, terms from the question and previous findings\n"
-        "- For Chinese topics use Chinese queries, for English topics use English queries\n"
+        "- Chinese queries help find Chinese sources (Baidu, Zhihu)\n"
+        "- English queries help find English sources (Wikipedia, Google Scholar)\n"
+        "- For proper nouns, include both Chinese and English forms if known\n"
         "- Output ONLY search queries, one per line, no numbering or explanations\n"
+        "- Mark language with [ZH] or [EN] prefix on each line\n"
     )
     user_prompt = (
         f"Original question: {question}\n\n"
         f"{prev_context}"
         f"Current search objective: {hop_target}\n\n"
-        f"Generate search queries:"
+        f"Generate both Chinese and English search queries:"
     )
 
     try:
@@ -265,8 +298,10 @@ def generate_queries_for_hop(
         for line in raw.strip().split("\n"):
             line = re.sub(r"^\d+[\.\)]\s*", "", line.strip())
             line = re.sub(r"^[-•]\s*", "", line).strip().strip('"').strip("'")
+            # Strip [ZH] / [EN] language markers (used for bilingual generation)
+            line = re.sub(r"^\[(ZH|EN|zh|en)\]\s*", "", line).strip()
             if line and len(line) >= 4:
                 queries.append(line)
-        return queries[:3] if queries else [hop_target]
+        return queries[:6] if queries else [hop_target]  # Allow up to 6 (3 ZH + 3 EN)
     except Exception:
         return [hop_target]

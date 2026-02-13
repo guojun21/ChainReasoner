@@ -539,6 +539,233 @@ def extract_csdn_content(html: str, url: str = "", query: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# New domain-aware extractors (2026-02-13)
+# ---------------------------------------------------------------------------
+
+def extract_arxiv_content(html: str, url: str = "", query: str = "") -> str:
+    """Extract paper metadata + abstract from arXiv abstract/HTML pages.
+
+    Targets: arxiv.org/abs/*, arxiv.org/html/*
+    Strategy:
+      1. Try ``#abs`` block (abstract page): title + authors + abstract.
+      2. Try ``.ltx_document`` (HTML-rendered paper): title + abstract + first
+         N paragraphs of the body.
+      3. Try ``blockquote.abstract`` (older arXiv layout).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    parts: List[str] = []
+
+    # ── Title ──
+    title_el = (
+        soup.find("h1", class_="title") or
+        soup.find("h1", class_="ltx_title") or
+        soup.find("meta", attrs={"name": "citation_title"})
+    )
+    if title_el:
+        if title_el.name == "meta":
+            parts.append(title_el.get("content", ""))
+        else:
+            parts.append(title_el.get_text(strip=True).replace("Title:", "").strip())
+
+    # ── Authors ──
+    authors_el = (
+        soup.find("div", class_="authors") or
+        soup.find("div", class_="ltx_authors")
+    )
+    if authors_el:
+        parts.append("Authors: " + authors_el.get_text(strip=True).replace("Authors:", "").strip())
+
+    # ── Abstract ──
+    abstract_el = (
+        soup.find("blockquote", class_="abstract") or
+        soup.find("div", class_="ltx_abstract") or
+        soup.find("div", id="abs")
+    )
+    if abstract_el:
+        abstract_text = abstract_el.get_text(strip=True)
+        # Remove leading "Abstract:" label
+        abstract_text = _re.sub(r"^Abstract\s*[:：]?\s*", "", abstract_text, flags=_re.IGNORECASE)
+        parts.append("Abstract: " + abstract_text)
+
+    # ── Body (first ~3000 chars from ltx_document or main content) ──
+    body_el = soup.find("div", class_="ltx_document") or soup.find("article")
+    if body_el:
+        body_parts: List[str] = []
+        char_budget = 3000
+        for p in body_el.find_all(["p", "div"], recursive=True):
+            # Skip if inside abstract (already extracted)
+            if p.find_parent(class_=_re.compile(r"abstract|ltx_abstract")):
+                continue
+            text = p.get_text(strip=True)
+            if text and len(text) > 15:
+                body_parts.append(_html_module.unescape(text))
+                char_budget -= len(text)
+                if char_budget <= 0:
+                    break
+        if body_parts:
+            parts.append("\n".join(body_parts))
+
+    result = "\n\n".join(parts).strip()
+    return result if len(result) > 50 else _generic_three_layer_pipeline(html, url, query)
+
+
+def extract_github_content(html: str, url: str = "", query: str = "") -> str:
+    """Extract README / issue / discussion content from GitHub pages.
+
+    Targets: github.com
+    Strategy:
+      - README pages: ``.markdown-body`` inside ``#readme``.
+      - Issue/PR pages: ``.comment-body`` elements (question + top answers).
+      - Repo landing: ``.markdown-body`` (first one is usually the README).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    parts: List[str] = []
+
+    # ── Repo name / title ──
+    repo_title = soup.find("strong", class_="mr-2") or soup.find("h1", class_="gh-header-title")
+    if repo_title:
+        parts.append(repo_title.get_text(strip=True))
+
+    # ── README ──
+    readme = soup.find("div", id="readme")
+    if readme:
+        md_body = readme.find("article", class_="markdown-body") or readme
+        text = md_body.get_text(separator="\n", strip=True)
+        if text and len(text) > 30:
+            parts.append(text[:4000])
+
+    # ── Issue / PR comments ──
+    if not readme:
+        comments = soup.find_all("div", class_="comment-body")
+        for i, comment in enumerate(comments[:5]):  # top 5 comments
+            text = comment.get_text(separator="\n", strip=True)
+            if text and len(text) > 20:
+                parts.append(f"[Comment {i+1}] {text[:2000]}")
+
+    # ── Fallback: any .markdown-body ──
+    if not parts:
+        for md in soup.find_all("article", class_="markdown-body"):
+            text = md.get_text(separator="\n", strip=True)
+            if text and len(text) > 30:
+                parts.append(text[:4000])
+                break
+
+    result = "\n\n".join(parts).strip()
+    return result if len(result) > 50 else _generic_three_layer_pipeline(html, url, query)
+
+
+def extract_stackoverflow_content(html: str, url: str = "", query: str = "") -> str:
+    """Extract question + top answers from StackOverflow pages.
+
+    Targets: stackoverflow.com, *.stackexchange.com
+    Strategy:
+      - Question: ``.question .js-post-body`` or ``#question .s-prose``.
+      - Answers: ``.answer .js-post-body`` sorted by vote count.
+      - Keep question title from ``#question-header h1``.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    parts: List[str] = []
+
+    # ── Question title ──
+    header = soup.find("div", id="question-header")
+    if header:
+        h1 = header.find("h1")
+        if h1:
+            parts.append("Q: " + h1.get_text(strip=True))
+
+    # ── Question body ──
+    question_div = soup.find("div", class_="question")
+    if question_div:
+        body = question_div.find("div", class_="js-post-body") or question_div.find("div", class_="s-prose")
+        if body:
+            text = body.get_text(separator="\n", strip=True)
+            if text:
+                parts.append(text[:2000])
+
+    # ── Answers (sorted by vote, take top 3) ──
+    answers = soup.find_all("div", class_="answer")
+    # Sort by data-score attribute if available
+    scored_answers: List[Tuple[int, Any]] = []
+    for ans in answers:
+        score_str = ans.get("data-answerid", "0")
+        vote_cell = ans.find("div", class_="js-vote-count")
+        vote = 0
+        if vote_cell:
+            try:
+                vote = int(vote_cell.get_text(strip=True))
+            except ValueError:
+                pass
+        scored_answers.append((vote, ans))
+    scored_answers.sort(key=lambda x: x[0], reverse=True)
+
+    for rank, (vote, ans) in enumerate(scored_answers[:3], 1):
+        body = ans.find("div", class_="js-post-body") or ans.find("div", class_="s-prose")
+        if body:
+            text = body.get_text(separator="\n", strip=True)
+            if text and len(text) > 20:
+                # Remove code blocks for brevity — facts are usually in prose
+                clean_text = _re.sub(r"```[\s\S]*?```", "[code]", text)
+                parts.append(f"[Answer {rank}, votes={vote}] {clean_text[:2000]}")
+
+    result = "\n\n".join(parts).strip()
+    return result if len(result) > 50 else _generic_three_layer_pipeline(html, url, query)
+
+
+def extract_news_generic_content(html: str, url: str = "", query: str = "") -> str:
+    """Extract article body from generic Chinese/international news sites.
+
+    Targets: sohu.com, sina.cn, ifeng.com, cnr.cn, 163.com, thepaper.cn,
+             and any site with standard ``<article>`` or ``[itemprop=articleBody]``.
+
+    Strategy (priority order):
+      1. ``[itemprop="articleBody"]`` — Schema.org standard.
+      2. ``<article>`` tag — HTML5 semantic.
+      3. Common class patterns: ``.article-content``, ``.post-content``,
+         ``.article_content``, ``#artibody``, ``.art_content``.
+      4. Fallback to generic 3-layer pipeline.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # Remove noise first
+    for tag_name in ("nav", "footer", "header", "aside", "script", "style",
+                     "form", "iframe", "noscript"):
+        for el in soup.find_all(tag_name):
+            el.decompose()
+    for el in soup.find_all(class_=_re.compile(
+            r"comment|recommend|related|sidebar|share|ad[sv]|copyright|disclaimer")):
+        el.decompose()
+
+    # ── Title ──
+    parts: List[str] = []
+    title_el = soup.find("h1") or soup.find("title")
+    if title_el:
+        title_text = title_el.get_text(strip=True)
+        if title_text:
+            parts.append(title_text)
+
+    # ── Article body — try multiple selectors ──
+    content_el = (
+        soup.find(attrs={"itemprop": "articleBody"}) or
+        soup.find("article") or
+        soup.find("div", class_=_re.compile(
+            r"article[_-]?content|post[_-]?content|art[_-]?content|"
+            r"article[_-]?body|main[_-]?content|entry[_-]?content")) or
+        soup.find("div", id=_re.compile(
+            r"artibody|article[_-]?content|main[_-]?content")) or
+        soup.find("div", class_="content")
+    )
+
+    if content_el:
+        for p in content_el.find_all(["p", "h2", "h3", "h4", "li", "blockquote"]):
+            text = p.get_text(strip=True)
+            if text and len(text) > 8:
+                parts.append(_html_module.unescape(text))
+
+    result = "\n\n".join(parts).strip()
+    return result if len(result) > 80 else _generic_three_layer_pipeline(html, url, query)
+
+
+# ---------------------------------------------------------------------------
 # Domain routing
 # ---------------------------------------------------------------------------
 
@@ -548,6 +775,7 @@ def _match_domain(netloc: str, pattern: str) -> bool:
 
 
 DOMAIN_EXTRACTORS: List[Tuple[str, Callable[[str, str, str], str]]] = [
+    # ── Existing extractors ──
     ("en.wikipedia.org", extract_wikipedia_content),
     ("zh.wikipedia.org", extract_wikipedia_content),
     ("ja.wikipedia.org", extract_wikipedia_content),
@@ -558,6 +786,29 @@ DOMAIN_EXTRACTORS: List[Tuple[str, Callable[[str, str, str], str]]] = [
     ("wapbaike.baidu.com", extract_baidu_baike_content),
     ("zhihu.com", extract_zhihu_content),
     ("blog.csdn.net", extract_csdn_content),
+    # ── New extractors (2026-02-13) ──
+    ("arxiv.org", extract_arxiv_content),
+    ("github.com", extract_github_content),
+    ("stackoverflow.com", extract_stackoverflow_content),
+    ("stackexchange.com", extract_stackoverflow_content),
+    # Chinese news sites
+    ("news.sohu.com", extract_news_generic_content),
+    ("m.sohu.com", extract_news_generic_content),
+    ("sohu.com", extract_news_generic_content),
+    ("sina.cn", extract_news_generic_content),
+    ("sina.com.cn", extract_news_generic_content),
+    ("finance.sina.cn", extract_news_generic_content),
+    ("ifeng.com", extract_news_generic_content),
+    ("cnr.cn", extract_news_generic_content),
+    ("163.com", extract_news_generic_content),
+    ("thepaper.cn", extract_news_generic_content),
+    # International news
+    ("bbc.com", extract_news_generic_content),
+    ("bbc.co.uk", extract_news_generic_content),
+    ("reuters.com", extract_news_generic_content),
+    ("cnn.com", extract_news_generic_content),
+    ("nytimes.com", extract_news_generic_content),
+    ("theguardian.com", extract_news_generic_content),
 ]
 
 

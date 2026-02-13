@@ -124,7 +124,13 @@ def send_structured_reasoning_request_to_llm(base_model: dict, question: str,
 
 def get_knowledge_only_answer_from_llm(base_model: dict, question: str,
                                        logger=None, trace_logger=None) -> str:
-    """LLM knowledge-only answer (no search evidence)."""
+    """LLM knowledge-only answer (no search evidence).
+
+    Why max_tokens=2500: Qwen3-max often produces long reasoning chains for
+    complex multi-hop questions.  With 1200 tokens the response was frequently
+    truncated *before* the ``Answer:`` line, making knowledge_answer empty and
+    disabling the knowledge-anchored dual-chain recovery.
+    """
     system_prompt = (
         "You are an expert at answering complex multi-hop questions using your own knowledge.\n\n"
         "TASK: Reason step by step through the question, then give ONLY the final answer.\n\n"
@@ -138,18 +144,43 @@ def get_knowledge_only_answer_from_llm(base_model: dict, question: str,
         "7. If the question shows a format example (e.g. '格式形如：XXX'), it only shows the answer TYPE.\n"
         "   Do NOT copy the example's specific words. Use the EXACT official name from your knowledge.\n"
         "   For example: if example says 'Limited' but the real name uses 'Ltd', output 'Ltd'.\n\n"
+        "IMPORTANT: Keep your reasoning concise (≤15 numbered steps). "
+        "You MUST end with the Answer: line.\n\n"
         "FORMAT:\nReasoning: [your step-by-step reasoning]\nAnswer: [your concise answer]\n"
     )
-    raw_response = send_chat_completion_request_with_retry(base_model, system_prompt, f"Question: {question}",
-                                     temperature=0.0, max_tokens=1200,
-                                     purpose="knowledge_answer", logger=logger,
-                                     trace_logger=trace_logger)
+    raw_response = send_chat_completion_request_with_retry(
+        base_model, system_prompt, f"Question: {question}",
+        temperature=0.0, max_tokens=2500,
+        purpose="knowledge_answer", logger=logger,
+        trace_logger=trace_logger)
     if not raw_response:
         return ""
+    # Primary extraction: look for "Answer:" line
     if "Answer:" in raw_response:
         return raw_response.split("Answer:")[-1].strip().split("\n")[0].strip()
+    # Fallback: truncated response — try to extract the best-guess entity from
+    # the last few lines of reasoning, which typically contain the conclusion.
     lines = [line.strip() for line in raw_response.strip().split("\n") if line.strip()]
-    return lines[-1] if lines else raw_response.strip()
+    if not lines:
+        return raw_response.strip()
+    # Look for a line that looks like a conclusion (mentions "answer", "therefore",
+    # a proper noun, or is the last short line).
+    import re as _re
+    for line in reversed(lines[-5:]):
+        # Check for explicit answer-like patterns in reasoning
+        m = _re.search(
+            r"(?:the answer is|answer[:\s]+|therefore[:\s,]+|因此|答案[是为：:]+)\s*(.+)",
+            line, _re.IGNORECASE,
+        )
+        if m:
+            candidate = m.group(1).strip().rstrip(".")
+            if candidate and len(candidate) < 150:
+                return candidate
+    # Last resort: return last line if it's short enough to be an entity
+    last = lines[-1]
+    if len(last) < 150:
+        return last
+    return ""
 
 
 def decompose_multi_hop_question_into_search_queries(base_model: dict, question: str,
@@ -253,12 +284,13 @@ def verify_answer_against_evidence_via_llm(base_model: dict, question: str, answ
                                      temperature=0.0, max_tokens=120,
                                      purpose="verify_answer", logger=logger,
                                      trace_logger=trace_logger)
-    label, confidence = "INSUFFICIENT", 0.0
+    label, confidence, reasoning = "INSUFFICIENT", 0.0, ""
     if raw_response:
         # Try structured parsing first
         import re as _re_verify
         label_match = _re_verify.search(r"Verdict:\s*(SUPPORTS|REFUTES|INSUFFICIENT)", raw_response, _re_verify.IGNORECASE)
         conf_match = _re_verify.search(r"Confidence:\s*([\d.]+)", raw_response)
+        reason_match = _re_verify.search(r"Reasoning:\s*(.+)", raw_response)
         if label_match:
             label = label_match.group(1).upper()
         if conf_match:
@@ -266,6 +298,8 @@ def verify_answer_against_evidence_via_llm(base_model: dict, question: str, answ
                 confidence = float(conf_match.group(1))
             except ValueError:
                 pass
+        if reason_match:
+            reasoning = reason_match.group(1).strip()
         # Fallback to legacy pipe-delimited format
         if not label_match:
             parts = raw_response.strip().split("|")
@@ -278,7 +312,10 @@ def verify_answer_against_evidence_via_llm(base_model: dict, question: str, answ
                     confidence = float(parts[1].strip())
                 except ValueError:
                     pass
-    return label, confidence
+        # If no structured reasoning found, use the full response as context
+        if not reasoning:
+            reasoning = raw_response.strip()
+    return label, confidence, reasoning
 
 
 def fuse_multi_hop_evidence_via_llm(
@@ -320,6 +357,55 @@ def fuse_multi_hop_evidence_via_llm(
         purpose="evidence_fusion",
         logger=logger, trace_logger=trace_logger,
     )
+
+
+def extract_corrected_entity_from_refutation_via_llm(
+    base_model: dict,
+    question: str,
+    refutation_reasoning: str,
+    logger=None,
+    trace_logger=None,
+) -> str:
+    """Extract the correct entity from a REFUTES verification reasoning.
+
+    Why (P0-f, from Enhancing-Multi-Hop-QA self_verification recovery):
+    When verify_answer returns REFUTES, its reasoning often names the *correct*
+    entity (e.g. "Evidence says RepRapPro Ltd, not RepRap Ltd").  Instead of
+    discarding this intelligence, we extract the correct entity as a corrected
+    answer — this is the highest-ROI recovery path since the verification
+    stage already did the hard work of finding the truth.
+    """
+    system_prompt = (
+        "A verification step found that a proposed answer is WRONG. "
+        "The verification reasoning below names or implies the CORRECT answer.\n\n"
+        "TASK: Extract the correct entity/answer from the reasoning text.\n\n"
+        "RULES:\n"
+        "1. Return ONLY the correct entity — a name, number, year, or short phrase\n"
+        "2. Use the EXACT form as it appears in the reasoning (do not paraphrase)\n"
+        "3. If the reasoning does not clearly name a correct entity, return EMPTY\n"
+        "4. Your output must be 1-15 words maximum\n"
+        "5. Do NOT include any explanation\n"
+    )
+    user_prompt = (
+        f"Original question: {question}\n\n"
+        f"Verification reasoning (answer was REFUTED):\n{refutation_reasoning}\n\n"
+        f"Correct entity (or EMPTY if not found):"
+    )
+    raw = send_chat_completion_request_with_retry(
+        base_model, system_prompt, user_prompt,
+        temperature=0.0, max_tokens=60,
+        purpose="extract_corrected_entity_from_refutation",
+        logger=logger, trace_logger=trace_logger,
+    )
+    if not raw:
+        return ""
+    cleaned = raw.strip().strip('"').strip("'")
+    # Reject if the LLM returned "EMPTY" or a refusal
+    if cleaned.upper() in ("EMPTY", "NONE", "N/A", "UNKNOWN", ""):
+        return ""
+    if len(cleaned) > 200:
+        return ""
+    return cleaned
 
 
 def arbitrate_among_candidate_answers_via_llm(
