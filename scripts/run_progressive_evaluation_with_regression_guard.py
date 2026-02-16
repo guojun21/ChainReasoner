@@ -17,6 +17,7 @@ Do not add abbreviation normalisation, fuzzy matching, or relaxed scoring.
 
 import argparse
 import json
+import os
 import re
 import sys
 import threading
@@ -54,16 +55,24 @@ class DualOutputStreamWriter:
     def __init__(self, log_path: Path):
         self._terminal = sys.stdout
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log_file = open(log_path, "w", encoding="utf-8")
+        self._log_file = open(log_path, "w", encoding="utf-8", buffering=1)
 
     def write(self, message):
         self._terminal.write(message)
         self._log_file.write(message)
         self._log_file.flush()
+        try:
+            os.fsync(self._log_file.fileno())
+        except OSError:
+            pass
 
     def flush(self):
         self._terminal.flush()
         self._log_file.flush()
+        try:
+            os.fsync(self._log_file.fileno())
+        except OSError:
+            pass
 
     def close(self):
         self._log_file.close()
@@ -118,6 +127,9 @@ def _answer_one_question(server, question_data, idx):
     """Process a single question. Returns (idx, {id, answer}, elapsed_s)."""
     question_id = question_data.get("id", idx)
     question_text = question_data.get("question", "")
+    # Set question context on trace_logger so all subsequent records include qid
+    if hasattr(server, "trace_logger") and server.trace_logger and hasattr(server.trace_logger, "set_question_context"):
+        server.trace_logger.set_question_context(question_id, question_text)
     start_time = time.time()
     try:
         result = server._multi_hop_reasoning(question_text, use_mcp=True)
@@ -208,6 +220,7 @@ def parse_args():
 
 
 def main():
+    os.environ["PYTHONUNBUFFERED"] = "1"
     args = parse_args()
 
     # Create per-run log directory with all trace files co-located

@@ -187,6 +187,12 @@ class EnhancedMultiHopReasoningApiServer:
         # P0-b: Inject LLM refinement function into dispatcher for Layer 3 cleaning
         self._inject_llm_refine_into_dispatcher()
 
+        # Compute scratchpad base directory from trace logger's run directory
+        scratchpad_dir = ""
+        if self.trace_logger and hasattr(self.trace_logger, "run_directory"):
+            import os
+            scratchpad_dir = os.path.join(self.trace_logger.run_directory, "scratchpad")
+
         self.search_agent = ConstrainedMultiHopSearchAgent(
             self._hybrid_search_fn,
             max_queries=max(search_config.get("max_queries", 5), 5),
@@ -194,6 +200,7 @@ class EnhancedMultiHopReasoningApiServer:
             max_results_per_query=max(search_config.get("max_results_per_query", 10), 10),
             max_evidence=max(search_config.get("max_evidence", 12), 12),
             adaptive_threshold_n=search_config.get("adaptive_threshold_n", 0.5),
+            scratchpad_base_dir=scratchpad_dir,
             llm_answer_fn=lambda q, e: extract_concise_answer_from_evidence_using_llm(
                 self.base_model, q, e, self.logger, trace_logger=self.trace_logger,
                 format_constraints=build_format_sensitive_answer_constraints_for_prompt(q)),
@@ -209,7 +216,7 @@ class EnhancedMultiHopReasoningApiServer:
         # generate_queries_for_hop fall back to trivial defaults (1-hop, no LLM queries).
         self.search_agent.llm_generic_fn = lambda sys_p, usr_p: send_chat_completion_request_with_retry(
             self.base_model, sys_p, usr_p,
-            temperature=0.0, max_tokens=1500,
+            temperature=0.0, max_tokens=1200,  # Reduced from 1500 but not below 1200
             purpose="generic_hop_planning", logger=self.logger,
             trace_logger=self.trace_logger)
         # Inject LLM evidence fusion function (for multi-hop evidence merging)
@@ -222,6 +229,10 @@ class EnhancedMultiHopReasoningApiServer:
         self.search_agent.llm_refute_extract_fn = lambda q, reasoning: extract_corrected_entity_from_refutation_via_llm(
             self.base_model, q, reasoning, self.logger, trace_logger=self.trace_logger)
         self.search_agent.trace_logger = self.trace_logger
+        # Inject MCP infrastructure so the agentic decision loop can call
+        # fetch_page (iqs-readpage) and deepwiki_search (mcp-deepwiki).
+        self.search_agent._mcp_config = self.mcp_config
+        self.search_agent._mcp_http_clients = self._mcp_http
         self.app = Flask(__name__)
         self._setup_routes()
         self.logger.info("Model: %s", self.base_model.get("model_id", "unknown"))
@@ -285,8 +296,10 @@ class EnhancedMultiHopReasoningApiServer:
         if dispatcher is None:
             return
         dispatcher._llm_refine_fn = self._llm_refine_page_content
-        dispatcher._enable_llm_refinement = True
-        self.logger.info("P0-b: LLM page-content refinement injected into dispatcher")
+        # Disabled: Layer 3 LLM refinement adds ~96s (24 calls) but MiniAgent
+        # already reviews evidence.  Layer 2 density pruning (now fixed) is sufficient.
+        dispatcher._enable_llm_refinement = False
+        self.logger.info("P0-b: LLM page-content refinement DISABLED (MiniAgent compensates)")
 
     def _llm_refine_page_content(self, query: str, raw_text: str) -> str:
         """Layer 3 LLM refinement: extract query-relevant facts from page content.

@@ -17,8 +17,11 @@
 | **P0-next** | 答案命名标准化 | Wing 4题格式错 | 🔴 待实施 | — | official name 二次搜索 + 中英文对齐 |
 | **P1** | 格式/语言对齐不足 | 10/52 错误（19%） | 部分已做 | Research_Agent, ReAct | 中英文双输出 + 前缀去除 + 昵称映射 |
 | **P1** | 搜索证据不足 | 13/52 错误（25%） | 部分已做 | crawl4ai, firecrawl | 搜索策略多样化 + 学术/媒体特定源 |
-| **P1-next** | 本地知识库缓存 | 跨题重复搜索 | 🔴 待实施 | bm25s, A-mem | 搜索结果持久化 + BM25 本地检索 + 跨题知识复用 |
-| **P2** | 验证环节太弱 | 错误答案未拦截 | 部分(置信度放弃) | Enhancing-MH-QA, Research_Agent | self-verification + 证据回查 |
+| **P1-next** | 本地知识库缓存 | 跨题重复搜索 | ✅ per-question scratchpad + BM25 | bm25s, A-mem | 搜索结果持久化 + BM25 本地检索 |
+| **P1-next** | Agentic 证据决策 | 管线答案可能错误 | ✅ Phase 2.7 模块化重构完成 | nanobot, deepagents | 工具注册表 + 大结果 offload + 三重协议容错 + 地理语言路由 |
+| **P2** | 验证环节太弱 | 错误答案未拦截 | 部分(置信度放弃+agentic) | Enhancing-MH-QA, Research_Agent | self-verification + 证据回查 |
+| **P2** | 密度剪枝过激 | 网页内容被过度删除 | ✅ 阈值+文本长度保护 | crawl4ai | DENSITY_THRESHOLD 0.48→0.32 |
+| **P2** | PDF 内容丢失 | PDF 文件被直接丢弃 | ✅ PyPDF2 文本提取 | — | PDF 下载+提取+存入 scratchpad |
 
 ---
 
@@ -30,6 +33,11 @@
 | 网页抓取质量差 | 三层清洗管线（规则 + 密度剪枝 + LLM 精炼）+ 域名感知提取器 |
 | LLM 非确定性 | 多候选一致性投票 + Jaccard 相似度聚类 + LLM 仲裁 |
 | **Wing 架构改造** (2026-02-13) | 5 项核心改动，详见下方 Wing 章节 |
+| **网页抓取管线加固** (2026-02-15) | NoneType Bug 修复 + 大文件下载保护（stream=True + 2MB 上限） |
+| **Agentic 证据决策循环** (2026-02-15) | nanobot 风格 tool-use loop（7 工具 × 8 轮上限），Phase 4.5 注入 |
+| **密度剪枝修复** (2026-02-15) | 阈值 0.48→0.32 + 默认标签权重 0.5→0.7 + 200 字符最小保护 |
+| **PDF 文本提取** (2026-02-15) | PyPDF2 提取 PDF 文本（5MB 上限）+ 自动路由 + 存入 scratchpad |
+| **Agentic Loop 工程化重构** (2026-02-15) | 单文件→10 文件模块化，工具注册表 + 大结果 offload + 三重协议容错 + 地理语言路由 + 迭代上限 12 |
 
 ### Wing 架构改造详情（2026-02-13）
 
@@ -825,6 +833,45 @@ def aggregate_answers(answers: List[str]) -> str:
 11. ✅ **置信度驱动放弃机制** — Wing 架构改动 4
 12. ✅ **跨跳结构化实体传递** — Wing 架构改动 5
 
+### Phase 2.5: 管线加固 + Agentic 决策层（2026-02-15）
+
+**已完成改动（6 项）：**
+
+#### 2.5-a: 网页抓取管线加固 ✅
+- **NoneType Bug 修复**：修复 `three_layer_html_content_cleaning_pipeline.py` 中 3 处 NoneType 错误（zhihu/baike JSON 解析、github repo_title）
+- **大文件下载保护**：`direct_http_web_page_content_fetcher.py` 改用 `stream=True`，header 检查 Content-Type/Content-Length 后再下载 body，2MB 上限
+- **效果**：页面抓取耗时从 89s 降至 5.4s，NoneType 错误消除
+
+#### 2.5-b: Agentic 证据决策循环 ✅
+- **新建 `src/mini_agent/mini_agent_loop.py`**（原 `agentic_evidence_decision_loop.py`）：nanobot 风格 while-tool-calls 循环
+- **7 个工具**：`list_files`、`get_index`、`read_file`、`grep_evidence`、`search_local`、`web_search`（限 2 次）、`submit_answer`
+- **XML 标签协议**：LLM 输出 `<tool_call>{"name": "...", "args": {...}}</tool_call>`，系统解析执行
+- **注入位置**：`constrained_multi_hop_search_agent.py` Phase 4.5（投票之后、验证之前）
+- **Q0 测试结果**：6 次工具调用（get_index → grep×3 → web_search → submit_answer），confidence=0.95，成功将管线错误答案 "RepRap Ltd" 纠正为 "RepRapPro Limited"，耗时 24s
+
+#### 2.5-c: 密度剪枝修复 ✅
+- **降低阈值**：`DENSITY_THRESHOLD` 0.48 → 0.32
+- **提高默认标签权重**：未知标签 0.5 → 0.7
+- **最小文本长度保护**：节点文本 > 200 字符时不剪枝
+- **效果**：L1/L2 字符数基本一致（如 L1=2969 L2=2969），不再过度剪枝
+
+#### 2.5-d: PDF 文本提取 ✅
+- **从 `_BINARY_FILE_SUFFIXES` 移除 `.pdf`**
+- **新增 `_fetch_and_extract_pdf_text()`**：PyPDF2 提取文本，5MB 上限，截断到 5000 字符
+- **Content-Type 路由**：URL 以 `.pdf` 结尾或 Content-Type 为 `application/pdf` 时自动走 PDF 提取
+- **依赖**：`PyPDF2>=3.0.0` 已加入 requirements.txt
+
+#### Q0 Mini 测试观察（run_20260215_043429）
+- Agentic loop 触发 ✅，6 次工具调用，confidence=0.95
+- Agentic loop 纠正管线答案 ✅（RepRap Ltd → RepRapPro Limited → RepRapPro Ltd）
+- 密度剪枝不再过激 ✅（L1≈L2，内容保留完整）
+- 55 个 evidence 文件 + 22 个 page 文件写入 scratchpad ✅
+- BM25 索引 572 个文档，25 次本地搜索 19 次命中 ✅
+- 总耗时 1444s（24 分钟），其中 agentic loop 仅 24s
+- GitHub extractor NoneType 错误仍存在但被 try/except 捕获，自动 fallback 到 generic pipeline
+
+---
+
 ### Phase 3: 冲击 70 分（下一步，预期 +25~35 分）
 
 **Tier 1: 必须做（预期 +10~15 分）**
@@ -837,15 +884,269 @@ def aggregate_answers(answers: List[str]) -> str:
 
 16. 🔴 **数值/年份精确验证** — 数字类答案从多源提取后取众数
 17. 🔴 **问题类型格式预判** — 提取前预判答案格式（数字/人名/机构名），格式不匹配强制重提取
-18. 🔴 **本地知识库缓存** — 搜索结果 + 抓取页面持久化到本地 BM25 索引，跨题复用
-    - 实现方案：搜索结果/页面内容存为 JSONL，每轮运行前加载已有数据
-    - 同题 100 道之间有信息复用潜力（同领域问题搜索重叠）
-    - 预期节省 30-50% 搜索调用，同时减少 BrightData 成本
+18. ✅ **本地知识库缓存** — 搜索结果 + 抓取页面持久化到本地 BM25 索引（per-question scratchpad 已实现）
+19. ✅ **Agentic 证据决策循环** — LLM 自主查阅 scratchpad 做最终决策（Phase 2.5-b 已实现）
 
 **Tier 3: 锦上添花（预期 +3~5 分）**
 
-19. 🔴 **Wikipedia 直达检索** — 人名/地名/机构名直接抓 Wikipedia 页面做精确提取
-20. 🔴 **并行模型投票** — 多温度/seed 生成候选答案
-21. 🔴 **答案后处理 pipeline 强化** — 中英文名对齐、格式约束执行
+20. 🔴 **Wikipedia 直达检索** — 人名/地名/机构名直接抓 Wikipedia 页面做精确提取
+21. 🔴 **并行模型投票** — 多温度/seed 生成候选答案
+22. 🔴 **答案后处理 pipeline 强化** — 中英文名对齐、格式约束执行
+23. ✅ **PDF 文本提取** — 不丢弃 PDF，PyPDF2 提取文本存入 scratchpad（Phase 2.5-d 已实现）
 
-### 总计预期路线：27 分（旧）→ Wing 架构 ~42 分 → Tier 1 完成 ~55 分 → Tier 2 完成 ~65 分 → Tier 3 完成 70+ 分
+### Phase 2.6: 8 轮迭代优化 (2026-02-15)
+
+**目标**: 通过 8 轮 mini-test 迭代，系统性地识别和修复管线痛点。
+
+#### 修复清单
+
+| Round | 痛点 | 修复 | 文件 |
+|-------|------|------|------|
+| R1 | 5跳×3轮=68次LLM调用(24min) + 9次NoneType错误 | MAX_RETRIEVAL_CYCLES 3→2, 最大跳数 5→4, 修复 attrs=None 导致的 NoneType | per_hop_result_validator_and_corrector.py, structured_multi_hop_reasoning_planner.py, three_layer_html_content_cleaning_pipeline.py |
+| R2 | Layer3 LLM精炼暴增到24次/96s | 禁用 Layer3 LLM page_content_refinement（agentic loop 已补偿） | enhanced_multi_hop_api_server.py |
+| R3 | (Q0连续3轮正确，无新痛点) | 无代码改动，进入Q1测试 | - |
+| R4 | MiniAgent 不调用 submit_answer, conf=0.5 | 改进 prompt 强调必须 submit_answer, max_iterations 8→6 | mini_agent_loop.py |
+| R5 | Page enrichment 30次/115s 太慢 | enrichment top_n 3→2 | language_aware_hybrid_search_dispatcher.py |
+| R6 | generic_hop_planning 仍是最大消耗 | max_tokens 1500→1200, FETCH_TIMEOUT 10→8s | enhanced_multi_hop_api_server.py, direct_http_web_page_content_fetcher.py |
+| R7 | max_tokens=800截断推理 + confidence boost有害 | max_tokens恢复1200, 移除confidence boost, 改进entity精确度prompt | mini_agent_loop.py, enhanced_multi_hop_api_server.py |
+| R8 | INSUFFICIENT验证结果错误触发fallback到knowledge_answer | 只在REFUTES时fallback，INSUFFICIENT保持当前答案 | constrained_multi_hop_search_agent.py |
+
+#### 指标变化
+
+| 指标 | Round 1 (基线) | Round 3 (Q0最佳) | Round 6 (Q1最佳) | 改善幅度 |
+|------|---------------|-----------------|-----------------|---------|
+| 总耗时 | 1444s (24min) | 1002s (16.7min) | 555s (9.3min) | **-62%** |
+| LLM调用 | 68 | 44 | 29 | **-57%** |
+| LLM耗时 | 275s | 182s | 114s | **-59%** |
+| NoneType错误 | 9 | 0 | 0 | **-100%** |
+| Page enrichment | 35次/151s | 59次/141s | 19次/61s | **-60%** |
+| Q0答案 | RepRapPro Ltd ✅ | RepRapPro Ltd ✅ | - | 稳定正确 |
+| Q1答案 | - | - | Magnus Mörner | 一致稳定 |
+
+#### 关键发现
+
+1. **INSUFFICIENT fallback bug（R8发现）**: 这是一个影响所有题目的严重 bug。当 reverse verification 返回 INSUFFICIENT（证据不足），系统错误地 fallback 到 knowledge_answer，导致正确答案被覆盖。修复后预计对整体得分有显著提升。
+2. **Layer3 LLM精炼的性价比极低**: 24次调用消耗96s但对答案质量无贡献。禁用后节省约100s且答案不变。
+3. **Agentic loop 是关键纠错机制**: 在 Q0 中，管线投票选了错误的 "RepRap Ltd"，agentic loop 纠正为 "RepRapPro Limited"。
+4. **BrightData 超时是不可控的外部因素**: 多次 timeout retry 增加了 20-60s 的不可控延迟。
+
+### 总计预期路线：27 分（旧）→ Wing 架构 ~42 分 → Phase 2.5 管线加固 ~45 分 → Phase 2.6 迭代优化 ~50 分 → Tier 1 完成 ~60 分 → Tier 2 完成 ~70 分 → Tier 3 完成 75+ 分
+
+---
+
+## Phase 3: ChainReasoner 全面优化（基于 Q83 失败复盘）
+
+### 优化内容（7 大模块，30+ 处代码修改）
+
+#### Phase 1: 多跳规划优化
+- **约束条件分解 prompt**: 在 hop planning system prompt 中增加"先列出所有独立约束条件，再为每个约束设计搜索跳"
+- **depends_on_hop 字段**: hop plan JSON 增加跳间依赖关系字段
+- **max_hops 5→5**: 允许复杂多约束题使用 5 跳
+
+#### Phase 2: 搜索查询优化
+- **多角度查询**: 要求 LLM 从 DIRECT 和 INDIRECT 两个角度生成查询
+- **约束覆盖**: 搜索"哪家公司"类问题时要求包含所有已知约束条件
+
+#### Phase 3: 证据收集优化
+- **enrichment top_n 2→3**: 恢复页面内容抓取数量
+- **内容哈希去重**: scratchpad 写入前检查 MD5 哈希，跳过重复证据（Q83 跳过了 249-312 条重复）
+- **BM25 min_score 1.5→1.0**: 降低本地检索阈值，减少漏召回
+
+#### Phase 4: 答案提取优化
+- **反确认偏差 prompt**: hop 评估增加"如果证据不明确，列出所有可能候选"指令
+- **alternative_entities 字段**: 提取实体时同时保留 top-2 替代候选
+- **ANTI-CONFIRMATION BIAS 规则**: 明确要求 LLM 不要只选第一个实体
+
+#### Phase 5: Agentic 决策层深度优化
+- **决策树**: grep<200字符→必须web_search, read_file<100字符→必须web_search
+- **自检清单**: submit_answer 前要求验证所有约束条件
+- **反思机制**: 第 3 次工具调用后插入反思提示
+- **证据不足检测**: 前 2 次本地工具<300字符时自动建议 web_search
+- **countdown 优化**: 第 4 轮建议 web_search，第 5 轮必须 submit
+- **无 tool_call 重试**: LLM 不输出 tool_call 时给出示例重试而非直接退出
+- **候选全同警告**: 所有候选答案相同时警告确认偏差
+- **max_iterations 6→8**: 增加迭代空间
+
+#### Phase 6: 投票与仲裁优化
+- **来源权重**: agentic_loop=1.5, search=1.2, hop2=1.0, knowledge=0.8, heuristic=0.6
+- **仲裁 prompt**: 增加"先识别所有约束条件，再逐一检查候选"指令
+
+#### Phase 7: 反向验证优化
+- **对抗性查询**: 验证阶段同时搜索排除当前答案的查询
+- **替代答案搜索**: confidence<0.8 时额外验证第二候选
+- **Better_entity 字段**: 验证 prompt 要求指出更匹配的不同实体
+
+### 测试结果
+
+| 题目 | 答案 | 正确? | Agentic Loop 行为 | 关键发现 |
+|------|------|-------|-------------------|---------|
+| Q1 | James Lockhart | ✅ agentic纠正 | 7次迭代, grep→read→grep→**web_search**→**fetch_page**→**web_search**→**submit_answer**, conf=0.95 | **Pipeline给出Werner Baer(错), agentic loop通过web_search+fetch_page成功纠正** |
+| Q10 | 靳东和雷佳音 | 待确认 | 7次迭代, grep→grep→search_local→web_search×3, 未submit | LLM搜索了"阿耐 本名 瓦特"但未找到足够证据 |
+| Q0 | RepRap Ltd | ❌ | 3次迭代, grep(247字符)→search_local, 未submit | Pipeline候选全部不含"RepRapPro", LLM随机性 |
+| Q83 | 通用汽车 | ❌ | 3次迭代, grep→grep("Stellantis"), 未submit | 搜索引擎结果中无"福特"相关证据 |
+
+### 关键发现
+
+1. **Q1 证明 agentic loop 优化有效**: Pipeline 投票选了错误的 Werner Baer，agentic loop 通过 web_search + fetch_page 找到正确答案 James Lockhart (conf=0.95)。这是优化前不可能实现的。
+2. **submit_answer 问题仍存在**: qwen3-max 在部分场景下不输出 `<tool_call>` 标签，导致 agentic loop 默认回退。已增加重试机制但效果有限。
+3. **证据去重生效**: 每次运行跳过 249-312 条重复证据，减少了 scratchpad 噪声。
+4. **Q83 是搜索引擎级别的问题**: 所有搜索引擎对 UAW 罢工查询都主要返回 GM/Stellantis 结果，"福特"需要极精准的查询才能找到。
+
+---
+
+### Phase 2.7: Agentic Loop 工程化重构（2026-02-15）
+
+**背景**：Phase 2.5-b 的 agentic 决策循环是单文件 637 行，存在三个核心差距 + 一个搜索语言缺陷：
+1. 迭代次数不足（硬编码 8 次，nanobot 默认 20 次）
+2. 工具结果硬截断 3000 字符（deepagents 用 offload + 头尾预览）
+3. XML 工具调用协议不稳定（qwen 可能输出格式不规范）
+4. 搜索语言判断缺失（中文问题+英语世界事件仍用中文搜索）
+
+**已完成改动（10 个新文件 + 1 个 shim）：**
+
+#### 2.7-a: 模块化拆分 ✅
+- 将 `src/agents/agentic_evidence_decision_loop.py`（637 行）拆分为 `src/mini_agent/` 模块（10 个文件）
+- 旧文件改为 backward-compatibility shim，import 路径不变
+- 遵循 `代码命名与重构规范.md` 的命名规则
+
+#### 2.7-b: 工具注册表模式 ✅
+- **`tool_base_and_registry.py`**：`MiniAgentToolBase` 抽象基类 + `MiniAgentToolRegistry` 注册表
+- 每个工具是独立类，自带 name/description/schema/when_to_use/when_not_to_use
+- 参数验证、执行、prompt 定义生成全部封装在工具类内
+- 借鉴 nanobot `tools/base.py` + `tools/registry.py`
+
+#### 2.7-c: 工具类实现 ✅
+- **`local_evidence_browsing_tools.py`**：5 个本地工具类（ListFiles, GetIndex, ReadFile, GrepEvidence, SearchLocal）
+- **`web_search_and_fetch_tools.py`**：3 个网络工具类（WebSearch, FetchPage, DeepWikiSearch）
+- **`answer_submission_tool.py`**：终止工具 `SubmitFinalAnswerTool`（is_terminal=True）
+
+#### 2.7-d: 多协议工具调用解析器 ✅
+- **`tool_call_protocol_parser.py`**：三重容错解析（XML tag > JSON block > bare JSON）
+- JSON 修复：处理 qwen 常见错误（尾逗号、单引号、缺失闭括号）
+- 每次解析记录使用的协议（xml_tag/json_block/freeform），便于分析
+
+#### 2.7-e: 大结果 offload 中间件 ✅
+- **`large_result_offload_middleware.py`**：超过 4000 字符的工具结果写入 scratchpad 文件
+- 生成头 5 行 + 尾 5 行预览，替换原始结果
+- 排除列表：list_files, get_index, submit_answer
+- 借鉴 deepagents `_process_large_message()` + `_create_content_preview()`
+
+#### 2.7-f: 动态系统提示构建 ✅
+- **`prompt_builder.py`**：从注册表动态生成工具定义和系统提示
+- 添加新工具时自动更新 prompt，无需手动编辑
+- 借鉴 nanobot `context.py` 的 `build_system_prompt()`
+
+#### 2.7-g: 问题地理-语言智能路由 ✅
+- **`question_geographic_language_router.py`**：三层判断（信号检测 → 规则引擎 → LLM 精细判断）
+- 输出语言优先级：english_first / chinese_first / bilingual_equal
+- 中文问题+英语世界事件 → 自动切换为英文优先搜索
+
+#### 2.7-h: 增强主循环 ✅
+- **`mini_agent_loop.py`**：迭代上限 8→12，自适应提前终止
+- 连续 2 次无工具调用 → 强制 submit（nanobot 风格）
+- 增强日志：每轮记录 tool/args/result_length/was_offloaded/protocol
+- 循环结束记录：iterations/parse_failures/offloaded_files/tool_breakdown/language_priority
+
+#### Q0 Mini 测试结果（run_20260215_173405）
+
+| 指标 | Phase 2.5-b（旧单文件） | Phase 2.7（新模块化） |
+|------|------------------------|----------------------|
+| 迭代次数 | 6 | 7（12 次上限内自适应终止） |
+| 工具调用 | 6 | 7（grep×3 + read×3 + submit×1） |
+| 解析失败 | 未记录 | 0（XML 协议全部成功） |
+| Offload 事件 | 无（硬截断） | 1 次（read_file 结果 offload 到文件） |
+| 语言路由 | 无 | english_first（正确识别英国公司话题） |
+| 置信度 | 0.95 | 0.95 |
+| 答案 | RepRapPro Ltd ✅ | RepRapPro Ltd ✅ |
+| Agentic 耗时 | 24s | 24.7s |
+
+#### 新增文件清单
+
+```
+src/mini_agent/
+├── __init__.py                              (~20 行)
+├── tool_base_and_registry.py                (~130 行)
+├── local_evidence_tools.py                  (~170 行)
+├── web_search_tools.py                      (~190 行)
+├── answer_submission_tool.py                (~40 行)
+├── tool_call_protocol_parser.py             (~190 行)
+├── large_result_offload.py                  (~130 行)
+├── prompt_builder.py                        (~120 行)
+├── language_router.py                       (~240 行)
+└── mini_agent_loop.py                       (~300 行)
+```
+
+`src/agents/agentic_evidence_decision_loop.py` → backward-compatibility shim（~18 行）
+`src/agentic/__init__.py` → backward-compatibility shim（~13 行）
+
+---
+
+### Phase 3.1: 语言路由 + IQS 优化 + Fetch 优先级 + Hop 日志增强 + 日志实时化（2026-02-16）
+
+**背景**：Q20 随机测试暴露多个问题 — 英文话题被中文搜索淹没、IQS 抓取低价值页面、FetchPage 优先级错误、回溯日志缺失、日志文件不实时更新。
+
+**已完成改动（8 项）：**
+
+#### 3.1-a: 智能语言路由注入搜索阶段 ✅
+- `constrained_multi_hop_search_agent.py`: 在 `answer()` 入口调用 `classify_question_geographic_language_priority`，将结果存入 `_language_priority`
+- `_perform_search_with_result_caching`: 在 `meta` 中传递 `language_priority`
+- `language_aware_hybrid_search_dispatcher.py`: `execute_search_query` 优先使用 `meta["language_priority"]` 而非字符级语言检测
+- **效果**：中文问题 + 英语话题 → 自动切换英文优先搜索
+
+#### 3.1-b: IQS 搜索效率优化 ✅
+- `alibaba_iqs_search_client.py`: `readpage_top_n` 5→2，减少无关页面抓取
+- 新增 `_LOW_VALUE_DOMAINS` 黑名单（音乐、视频、小众百科等 15+ 域名）
+- 新增 `_is_low_value_domain()` 方法，跳过黑名单域名的 readpage 抓取
+- `language_priority == "english_first"` 时跳过 IQS readpage enrichment
+- **效果**：IQS enrichment 调用量减少 60%+
+
+#### 3.1-c: FetchPage 优先级反转 ✅
+- `web_search_and_fetch_tools.py`: 直接 HTTP fetcher 改为主路径，IQS readpage 改为 fallback
+- `MAX_FETCH_PAGE_CALLS_PER_QUESTION` 2→4
+- **效果**：页面抓取成功率提升，减少对 IQS 的依赖
+
+#### 3.1-d: BrightData 韧性增强 ✅
+- `language_aware_hybrid_search_dispatcher.py`: `_MAX_FAIL_STREAK` 3→5
+- **效果**：BrightData 偶发超时不会过早禁用搜索引擎
+
+#### 3.1-e: Hop 回溯日志增强 ✅
+- `constrained_multi_hop_search_agent.py`: 每跳后输出 `[HOP {n} RESULT]` 日志（valid/confidence/entity）
+- 新增 `[BACKTRACK CHECK]` 日志，记录回溯条件检查结果
+- 收集 `hop_evaluation_summaries` 列表，传入 MiniAgent
+
+#### 3.1-f: Agent 置信度注入 ✅
+- `prompt_builder.py`: 新增 `hop_evaluations` 参数
+- 将 hop 评估结果（hop_num/entity/valid/confidence）注入 MiniAgent 系统提示
+- 低置信度 hop 会触发警告，防止 agent 过度自信
+- `mini_agent_loop.py`: 传递 `hop_evaluations` 参数
+
+#### 3.1-g: 日志完全实时化 ✅
+- `per_run_faithful_api_call_trace_logger.py`: 所有 trace 文件改用 `buffering=1`（行缓冲）
+- `_write_record()`: 在 `flush()` 后增加 `os.fsync()` 强制落盘
+- `logger_config.py`: `RotatingFileHandler` 改用 `_FlushingRotatingFileHandler`（每条 emit 后 flush）
+- `logger_config.py`: `StreamHandler` 输出流包装为 `_FlushingStreamWrapper`（每次 write 后 flush）
+- `run_progressive_evaluation_with_regression_guard.py`: `DualOutputStreamWriter` 加 `buffering=1` + `os.fsync()`
+- `run_progressive_evaluation_with_regression_guard.py`: 入口设置 `PYTHONUNBUFFERED=1`
+- **效果**：所有日志文件（trace JSONL + eval_progress.txt + logging 输出）写入后立即可见
+
+#### 3.1-h: PyPDF2 安装修复 ✅
+- 发现 `.venv` 中缺少 PyPDF2，手动安装
+
+#### Q0 Mini 测试结果（run_20260216_202643）
+
+| 指标 | Phase 3（之前） | Phase 3.1（之后） |
+|------|----------------|------------------|
+| 最终答案 | RepRap Ltd ❌ | **RepRapPro Ltd ✅** |
+| 得分 | 0/1 | **1/1** |
+| 总耗时 | ~24min | 1236s (20.6min) |
+| 回溯触发 | 无日志记录 | Hop 2 触发回溯（Conway → RepRap Ltd） |
+| 语言路由 | 未注入搜索 | english_first 正确传递 |
+| 投票候选 | 3 个 | 5 个（hop2/search/knowledge/heuristic/knowledge_chain） |
+| 投票仲裁 | — | LLM 仲裁选 RepRapPro Limited（knowledge） |
+| Agentic loop | 3 次迭代 | 11 次迭代（grep×4 + read×2 + web_search×3 + fetch×1 + submit） |
+
+**关键发现**：
+1. **投票机制是答对的核心** — 5 个 hop 都没直接找到 RepRapPro，但 knowledge 候选给出了正确答案，LLM 仲裁正确选择
+2. **回溯日志可追溯** — Hop 2 的 `[BACKTRACK CHECK]` 记录了 Conway → RepRap Ltd 的回溯过程
+3. **IQS 优化生效** — 英文话题下跳过了 IQS readpage enrichment
+4. **耗时瓶颈在 Hop 3-4** — 系统知道 Conway 不对但搜不到 Adrian Bowyer（RepRap 创始人），白费 300+ 秒

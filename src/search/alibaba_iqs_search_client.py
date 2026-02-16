@@ -50,9 +50,24 @@ def parse_iqs_search_result_markdown_into_structured_list(markdown_text: str) ->
 class AlibabaIQSSearchClient(AbstractSearchClientInterface):
     """Alibaba Cloud IQS via HTTP MCP — ``common_search`` + ``readpage_scrape``."""
 
+    # Domains whose readpage_scrape results are almost always noise or irrelevant.
+    # Why: Q20 test showed IQS scraping kuwo music, moegirl wiki, etc. for a
+    # history question — each scrape takes 5-22s and returns garbage.
+    _LOW_VALUE_DOMAINS = frozenset({
+        "kuwo.cn", "kugou.com", "bilibili.com", "toutiao.com",
+        "moegirl.org.cn", "douyin.com", "ixigua.com", "youku.com",
+        "iqiyi.com", "qq.com",
+    })
+
     def __init__(self, search_client: ModelContextProtocolHttpTransportClient,
                  readpage_client: Optional[ModelContextProtocolHttpTransportClient] = None,
-                 readpage_top_n: int = 5):
+                 readpage_top_n: int = 2):
+        """Initialize IQS client.
+
+        Why readpage_top_n=2 (down from 5): Most IQS search results beyond
+        the top 2 are low-quality for non-Chinese queries, and each scrape
+        takes 5-22s.  Reducing to 2 saves 15-66s per search call.
+        """
         self.search_client = search_client
         self.readpage_client = readpage_client
         self.readpage_top_n = readpage_top_n
@@ -74,6 +89,24 @@ class AlibabaIQSSearchClient(AbstractSearchClientInterface):
                 url=readpage_cfg["url"], api_key=readpage_cfg.get("api_key", ""))
 
         return cls(search_client=search_mc, readpage_client=readpage_mc)
+
+    @classmethod
+    def _is_low_value_domain(cls, url: str) -> bool:
+        """Check if URL belongs to a domain known to return noisy/irrelevant content.
+
+        Why: IQS search results often include music sites (kuwo), video sites
+        (bilibili), and niche wikis (moegirl) whose scraped content is 99%
+        unrelated to factual questions.
+        """
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url).hostname or ""
+            for bad_domain in cls._LOW_VALUE_DOMAINS:
+                if host == bad_domain or host.endswith("." + bad_domain):
+                    return True
+        except Exception:
+            pass
+        return False
 
     def execute_search_query(self, query: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         start_time = time.time()
@@ -120,11 +153,22 @@ class AlibabaIQSSearchClient(AbstractSearchClientInterface):
 
         # Enrich top results with scraped full-page content for better evidence
         # P0-b: apply Layer 1 cleaning to readpage_scrape results to remove noise
-        if self.readpage_client and results:
+        # Skip readpage entirely when language_priority is english_first — IQS
+        # readpage_scrape is slow (5-22s per page) and returns poor content for
+        # English pages.  The direct HTTP fetcher handles those better.
+        meta = meta or {}
+        skip_readpage = meta.get("language_priority") == "english_first"
+        if skip_readpage:
+            logger.info("IQS readpage SKIPPED: language_priority=english_first, "
+                        "English pages use direct HTTP fetcher instead")
+        if self.readpage_client and results and not skip_readpage:
             enrichment_count = min(self.readpage_top_n, len(results))
             for idx in range(enrichment_count):
                 page_url = results[idx].get("url", "")
                 if not page_url:
+                    continue
+                if self._is_low_value_domain(page_url):
+                    logger.info("IQS readpage SKIPPED low-value domain: %s", page_url[:80])
                     continue
                 try:
                     full_text = self.readpage_client.invoke_mcp_tool_via_http(

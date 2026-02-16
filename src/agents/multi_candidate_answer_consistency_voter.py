@@ -31,6 +31,18 @@ CONSENSUS_SIMILARITY_THRESHOLD = 0.70
 # Priority order for tie-breaking when multiple answers agree equally
 ANSWER_SOURCE_PRIORITY_ORDER = ["hop2", "search", "knowledge", "heuristic"]
 
+# Source reliability weights for weighted voting
+# mini_agent has tool-verified evidence, search has direct evidence,
+# knowledge is LLM-only, heuristic is frequency-based
+ANSWER_SOURCE_WEIGHTS: Dict[str, float] = {
+    "mini_agent": 1.5,
+    "agentic_loop": 1.5,  # backward compat alias
+    "search": 1.2,
+    "hop2": 1.0,
+    "knowledge": 0.8,
+    "heuristic": 0.6,
+}
+
 # Articles and stopwords to strip for comparison
 _COMPARISON_STOPWORDS = frozenset({
     "the", "a", "an", "of", "in", "at", "on", "for", "to", "and", "is", "was",
@@ -122,15 +134,15 @@ def detect_consensus_among_answer_candidates(
     best_pair = pairs[0]
 
     if best_pair[2] >= CONSENSUS_SIMILARITY_THRESHOLD:
-        # Pick the answer from the higher-priority source in the agreeing pair
+        # Pick the answer from the higher-WEIGHT source in the agreeing pair
         src_a, src_b, sim = best_pair
-        priority_a = ANSWER_SOURCE_PRIORITY_ORDER.index(src_a) if src_a in ANSWER_SOURCE_PRIORITY_ORDER else 99
-        priority_b = ANSWER_SOURCE_PRIORITY_ORDER.index(src_b) if src_b in ANSWER_SOURCE_PRIORITY_ORDER else 99
-        winner_source = src_a if priority_a <= priority_b else src_b
+        weight_a = ANSWER_SOURCE_WEIGHTS.get(src_a, 1.0)
+        weight_b = ANSWER_SOURCE_WEIGHTS.get(src_b, 1.0)
+        winner_source = src_a if weight_a >= weight_b else src_b
         return (
             candidates[winner_source],
             min(1.0, sim + 0.1),  # slight confidence boost for agreement
-            f"consensus:{src_a}+{src_b}(sim={sim:.2f})->prefer:{winner_source}",
+            f"consensus:{src_a}(w={weight_a})+{src_b}(w={weight_b})(sim={sim:.2f})->prefer:{winner_source}",
         )
 
     # Check for majority (3+ candidates with same normalised text)
@@ -190,9 +202,13 @@ def select_best_answer_via_llm_arbitration(
         "You are an answer quality evaluator. Given a question and multiple candidate answers "
         "from different reasoning paths, select the BEST answer.\n\n"
         "Evaluate based on:\n"
-        "1. Specificity and completeness (more precise answers are better)\n"
-        "2. Consistency with the question's requirements\n"
-        "3. Whether it directly answers what is asked\n\n"
+        "1. CONSTRAINT MATCHING: Does the answer satisfy ALL constraints in the question? "
+        "(e.g. geographic, temporal, entity type, relationship constraints)\n"
+        "2. Specificity and completeness (more precise answers are better)\n"
+        "3. Consistency with the question's requirements\n"
+        "4. Whether it directly answers what is asked\n\n"
+        "IMPORTANT: First identify ALL constraints in the question, then check each candidate "
+        "against EVERY constraint. Reject candidates that violate any constraint.\n\n"
         f"Output ONLY a single letter ({valid_labels}). No explanation."
     )
     user_prompt = (

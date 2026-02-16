@@ -94,7 +94,7 @@ TAG_WEIGHTS: Dict[str, float] = {
     "dl": 0.5, "dt": 0.5, "dd": 0.5,
 }
 
-DENSITY_THRESHOLD = 0.48
+DENSITY_THRESHOLD = 0.32  # Lowered from 0.48 to avoid over-aggressive pruning
 
 # Metric weights (crawl4ai defaults)
 METRIC_WEIGHTS = {
@@ -128,6 +128,8 @@ def _remove_negative_pattern_elements(soup: BeautifulSoup) -> None:
     """Remove elements whose class or id matches NEGATIVE_PATTERNS."""
     for element in soup.find_all(True):
         if not isinstance(element, Tag):
+            continue
+        if element.attrs is None:
             continue
         classes = " ".join(element.get("class", []))
         element_id = element.get("id", "")
@@ -213,6 +215,8 @@ def layer1_extract_text(soup: BeautifulSoup) -> str:
 def _compute_class_id_weight(node: Tag) -> float:
     """Negative weight for noise-indicating class/id values."""
     score = 0.0
+    if node.attrs is None:
+        return score
     classes = " ".join(node.get("class", []))
     if classes and NEGATIVE_PATTERNS.search(classes):
         score -= 0.5
@@ -254,7 +258,7 @@ def _compute_composite_score(node: Tag) -> float:
     total_weight += METRIC_WEIGHTS["link_density"]
 
     # tag_weight
-    tag_score = TAG_WEIGHTS.get(node.name, 0.5)
+    tag_score = TAG_WEIGHTS.get(node.name, 0.7)  # Default raised from 0.5 to preserve more content
     score += METRIC_WEIGHTS["tag_weight"] * tag_score
     total_weight += METRIC_WEIGHTS["tag_weight"]
 
@@ -278,8 +282,15 @@ def _prune_tree_by_density(node: Tag, threshold: float = DENSITY_THRESHOLD) -> N
     score = _compute_composite_score(node)
 
     if score < threshold and node.name not in ("body", "html", "[document]"):
-        node.decompose()
-        return
+        # Minimum text length protection: keep nodes with substantial text
+        # even if their density score is low (e.g. content-heavy divs with
+        # complex markup).  200 chars ≈ 2-3 sentences of useful content.
+        node_text = node.get_text(strip=True)
+        if len(node_text) > 200:
+            pass  # Keep this node — it has enough text to be valuable
+        else:
+            node.decompose()
+            return
 
     # Process children (copy list to allow mutation)
     children = [child for child in node.children if isinstance(child, Tag)]
@@ -416,6 +427,9 @@ def extract_baidu_baike_content(html: str, url: str = "", query: str = "") -> st
         try:
             state_text = state_match.group(1).replace("undefined", '""')
             state = _json.loads(state_text)
+            # Guard: _json.loads("null") returns None — must be a dict to proceed
+            if not isinstance(state, dict):
+                state = {}
             # Navigate to article content — handle None values safely
             article = state.get("lemmaData") or state.get("article") or {}
             if not isinstance(article, dict):
@@ -472,6 +486,9 @@ def extract_zhihu_content(html: str, url: str = "", query: str = "") -> str:
     if state_match:
         try:
             state = _json.loads(state_match.group(1))
+            # Guard: _json.loads("null") returns None — must be a dict to proceed
+            if not isinstance(state, dict):
+                state = {}
             entities = state.get("initialState", {}).get("entities", {})
             answers = entities.get("answers", {})
             content_parts = []
@@ -623,8 +640,10 @@ def extract_github_content(html: str, url: str = "", query: str = "") -> str:
 
     # ── Repo name / title ──
     repo_title = soup.find("strong", class_="mr-2") or soup.find("h1", class_="gh-header-title")
-    if repo_title:
-        parts.append(repo_title.get_text(strip=True))
+    if repo_title is not None:
+        title_text = repo_title.get_text(strip=True)
+        if title_text:
+            parts.append(title_text)
 
     # ── README ──
     readme = soup.find("div", id="readme")
@@ -849,7 +868,8 @@ def _generic_three_layer_pipeline(
     if enable_llm_refinement and llm_refine_fn and query:
         text = layer3_llm_refinement(text, query, llm_refine_fn)
 
-    return text
+    # Guard: never return None — callers expect a string
+    return text or ""
 
 
 # ---------------------------------------------------------------------------
@@ -943,7 +963,8 @@ def clean_html_with_three_layer_pipeline(
             cleaning_elapsed_ms=elapsed_ms,
         )
 
-    return final_text
+    # Guard: never return None — callers expect a string
+    return final_text or ""
 
 
 def apply_layer1_only(html: str) -> str:

@@ -7,8 +7,34 @@ Provides centralized logging configuration for all MultiHop Agent interfaces.
 
 
 import logging
+import sys
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
+
+
+class _FlushingStreamWrapper:
+    """Wrap a stream so every write() is followed by flush() for real-time output."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, msg):
+        self._stream.write(msg)
+        self._stream.flush()
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+class _FlushingRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that flushes after every emit for real-time log visibility."""
+
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
 
 
 class MultiHopLogger:
@@ -49,17 +75,17 @@ class MultiHopLogger:
         log_filename = log_file or f"{name}.log"
         log_path = cls._log_dir / log_filename
         
-        file_handler = RotatingFileHandler(
+        file_handler = _FlushingRotatingFileHandler(
             log_path,
             maxBytes=10*1024*1024,
             backupCount=5,
             encoding='utf-8'
         )
         file_handler.setLevel(level)
-        file_handler.flush()
         
         console_handler = logging.StreamHandler()
         console_handler.setLevel(level)
+        console_handler.stream = _FlushingStreamWrapper(console_handler.stream)
         
         formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s',

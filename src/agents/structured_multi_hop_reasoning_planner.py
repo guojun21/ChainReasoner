@@ -65,20 +65,30 @@ def generate_structured_multi_hop_plan(
 
     system_prompt = (
         "你是一个多跳推理规划专家。给定一个复杂问题，你需要分析它的推理链并输出结构化的多跳计划。\n\n"
+        "## 第一步：约束条件分解\n"
+        "在设计跳之前，先识别问题中的所有独立约束条件。例如：\n"
+        "- 地理约束（北美、欧洲、亚洲等）\n"
+        "- 时间约束（20世纪后半叶、2010年代末等）\n"
+        "- 实体类型约束（公司、组织、人物等）\n"
+        "- 行为/属性约束（建立网络、使用区块链、规模化生产等）\n"
+        "- 关系约束（物流平台对接、劳资谈判参与方等）\n"
+        "每个约束条件至少被一个 hop 覆盖。\n\n"
         "## 核心原则（Wing 高分架构）\n"
         "- 每个独立线索拆成一个独立的 hop（不要合并多个线索到一跳）\n"
-        "- 大多数竞赛题需要 3-5 跳（平均 4 跳）\n"
+        "- 大多数竞赛题需要 3-5 跳（平均 4 跳），复杂多约束题可用 5 跳\n"
         "- 每跳的 target 必须是可搜索的具体实体/事实，不能是泛化描述\n"
-        "- 每跳增加 domain 字段（从 5 个领域中选 1 个）\n\n"
+        "- 每跳增加 domain 字段（从 5 个领域中选 1 个）\n"
+        "- 每跳增加 depends_on_hop 字段（本跳依赖哪个前序跳的实体，无依赖填 0）\n\n"
         "## 规则\n"
         "1. 判断问题需要几跳推理（通常 3-5 跳，简单问题至少 2 跳）\n"
-        "2. 每跳必须有明确的搜索目标(target)、终止条件(stop_condition)和领域(domain)\n"
+        "2. 每跳必须有明确的搜索目标(target)、终止条件(stop_condition)、领域(domain)和依赖(depends_on_hop)\n"
         "3. 后跳的 target 应依赖前跳的结果\n"
         "4. 对于反推类问题（由结果推原因），按逆序拆解\n"
         "5. 中文问题用中文描述target，英文问题用英文描述target\n"
-        "6. domain 必须是以下 5 个之一: academic, business, government, culture, news\n\n"
+        "6. domain 必须是以下 5 个之一: academic, business, government, culture, news\n"
+        "7. 如果问题涉及多个不同实体（如一家欧洲公司和一家美国公司），必须分别为每个实体设计独立的搜索跳\n\n"
         "## 输出格式（严格JSON，无任何额外文本）\n"
-        '{"hop_count": 数字, "hops": [{"hop_num": 1, "target": "搜索目标", "stop_condition": "获取到X信息即停止", "domain": "academic"}, ...], "total_stop_condition": "获取到完整答案"}\n\n'
+        '{"hop_count": 数字, "hops": [{"hop_num": 1, "target": "搜索目标", "stop_condition": "获取到X信息即停止", "domain": "academic", "depends_on_hop": 0}, ...], "total_stop_condition": "获取到完整答案"}\n\n'
         "## 示例 1（5 跳复杂题）\n"
         '问题: "一位欧洲学者创立的开源硬件商业实体在亚洲保留了运营但在欧洲停止了交易，该实体的英文名称是什么？"\n'
         '输出: {"hop_count": 5, "hops": ['
@@ -109,11 +119,17 @@ def generate_structured_multi_hop_plan(
     try:
         raw = llm_fn(system_prompt, user_prompt)
         if not raw:
-            return dict(DEFAULT_HOP_PLAN)
-        return _parse_hop_plan_json(raw, question)
+            result = dict(DEFAULT_HOP_PLAN)
+            result["raw_llm_response"] = ""
+            return result
+        parsed = _parse_hop_plan_json(raw, question)
+        parsed["raw_llm_response"] = raw
+        return parsed
     except Exception as exc:
         logger.warning("Failed to generate hop plan: %s", exc)
-        return dict(DEFAULT_HOP_PLAN)
+        result = dict(DEFAULT_HOP_PLAN)
+        result["raw_llm_response"] = f"EXCEPTION: {exc}"
+        return result
 
 
 def _parse_hop_plan_json(raw: str, question: str) -> Dict[str, Any]:
@@ -159,7 +175,7 @@ def _parse_hop_plan_json(raw: str, question: str) -> Dict[str, Any]:
             hop_count = 2
         else:
             hop_count = 1
-    plan["hop_count"] = min(int(hop_count), 5)  # Wing-architecture: cap at 5 hops
+    plan["hop_count"] = min(int(hop_count), 5)  # Allow up to 5 hops for complex multi-constraint questions
 
     # Ensure each hop has required fields (including Wing-architecture domain)
     for hop in plan["hops"]:
@@ -167,6 +183,7 @@ def _parse_hop_plan_json(raw: str, question: str) -> Dict[str, Any]:
         hop.setdefault("stop_condition", "获取到相关信息")
         hop.setdefault("hop_num", plan["hops"].index(hop) + 1)
         hop.setdefault("domain", "")  # Wing-architecture: domain for search routing
+        hop.setdefault("depends_on_hop", 0)  # 0 = no dependency on previous hop
 
     plan.setdefault("total_stop_condition", "获取到完整答案")
     return plan
@@ -272,14 +289,20 @@ def generate_queries_for_hop(
         ) + "\n\nUse the exact entity names found above in your new search queries.\n\n"
 
     system_prompt = (
-        "Generate precise search queries for a specific research objective.\n"
-        "Rules:\n"
+        "Generate precise search queries for a specific research objective.\n\n"
+        "## Query Generation Strategy\n"
+        "Generate queries from TWO angles:\n"
+        "- DIRECT: Search for the target entity/fact directly\n"
+        "- INDIRECT: Search for related events/relationships that can help identify the target\n\n"
+        "## Rules\n"
         "- Generate 2-3 CHINESE queries AND 2-3 ENGLISH queries (both are required!)\n"
         "- Each query should be 5-20 words\n"
         "- Include specific names, dates, terms from the question and previous findings\n"
         "- Chinese queries help find Chinese sources (Baidu, Zhihu)\n"
         "- English queries help find English sources (Wikipedia, Google Scholar)\n"
         "- For proper nouns, include both Chinese and English forms if known\n"
+        "- If searching for 'which company/person/entity', include ALL known constraints\n"
+        "  (e.g. 'European EV company blockchain supply chain 2019' not just 'EV company')\n"
         "- Output ONLY search queries, one per line, no numbering or explanations\n"
         "- Mark language with [ZH] or [EN] prefix on each line\n"
     )

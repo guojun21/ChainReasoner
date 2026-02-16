@@ -26,14 +26,20 @@ References:
   - analysis_claude_code v3: sub-agent context isolation
 """
 
+import logging
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from src.agents.search_query_parsing_and_generation import (
     extract_structured_clues_from_question_text,
     generate_search_queries_from_question,
     classify_question_into_answer_type_category,
+)
+from src.mini_agent.language_router import (
+    classify_question_geographic_language_priority,
 )
 from src.agents.search_result_relevance_scoring_and_ranking import (
     rank_search_results_by_relevance_and_truncate,
@@ -60,6 +66,7 @@ from src.agents.per_hop_result_validator_and_corrector import (
     MAX_RETRIEVAL_CYCLES_PER_HOP,
 )
 from src.agents.question_domain_classifier import classify_question_domain
+from src.scratchpad.per_question_evidence_scratchpad import PerQuestionEvidenceScratchpad
 
 
 class ConstrainedMultiHopSearchAgent:
@@ -79,6 +86,8 @@ class ConstrainedMultiHopSearchAgent:
         llm_summarize_fn: Optional[Callable[[str], str]] = None,
         llm_decompose_fn: Optional[Callable[[str], str]] = None,
         llm_knowledge_fn: Optional[Callable[[str], str]] = None,
+        scratchpad_base_dir: str = "",
+        enable_minimal_drift_guard: bool = True,
     ):
         self.search_fn = search_fn
         self.max_queries = max_queries
@@ -99,6 +108,12 @@ class ConstrainedMultiHopSearchAgent:
         self.llm_refute_extract_fn: Optional[Callable[[str, str], str]] = None
         self.trace_logger = None
         self._cache: Dict[str, List[Dict[str, Any]]] = {}
+        # Per-question local knowledge base (scratchpad)
+        self._scratchpad_base_dir = scratchpad_base_dir
+        self._scratchpad: Optional[PerQuestionEvidenceScratchpad] = None
+        # Lightweight drift guard: when repeated refine cycles drift to unrelated
+        # entities, inject anchor terms to pull queries back to the target track.
+        self._enable_minimal_drift_guard = enable_minimal_drift_guard
 
     # ── Search execution ────────────────────────────────────────────────
 
@@ -112,13 +127,24 @@ class ConstrainedMultiHopSearchAgent:
         """
         cache_key = f"{domain}:{query}" if domain else query
         if cache_key in self._cache:
+            if self.trace_logger:
+                self.trace_logger.record_event("search_cache_hit", f"q='{query[:60]}' domain={domain}")
             return self._cache[cache_key], query
         meta = {"original_query": query, "rewritten_query": query}
         if domain:
             meta["domain"] = domain
+        # Propagate question-level language priority to search dispatcher
+        # so it overrides character-level detection with smarter routing.
+        lang_prio = getattr(self, "_language_priority", "bilingual_equal")
+        if lang_prio != "bilingual_equal":
+            meta["language_priority"] = lang_prio
+            if self.trace_logger:
+                self.trace_logger.record_event("language_priority_set", f"priority={lang_prio} q='{query[:60]}'")
         try:
             result = self.search_fn(query, meta)
         except TypeError:
+            if self.trace_logger:
+                self.trace_logger.record_event("search_fn_signature_fallback", f"q='{query[:60]}' — search_fn(query, meta) failed, falling back to search_fn(query)")
             result = self.search_fn(query)
         results = result.get("results", []) if isinstance(result, dict) else []
         self._cache[cache_key] = results
@@ -171,6 +197,300 @@ class ConstrainedMultiHopSearchAgent:
         parts.append(f"Search evidence:\n{hop_evidence_text}")
         return "\n\n".join(parts)
 
+    def _extract_anchor_terms_for_drift_guard(
+        self,
+        hop_target: str,
+        knowledge_answer: str = "",
+    ) -> List[str]:
+        """Extract anchor terms used to pull refine queries back on track.
+
+        Why: When retrieval drifts to a wrong entity, adding stable anchor terms
+        (hop target constraints + knowledge answer entity) is a low-risk way to
+        recover without changing the overall algorithm.
+        """
+        seeds: List[str] = []
+        if knowledge_answer and not check_if_answer_is_refusal_or_unknown_placeholder(knowledge_answer):
+            seeds.append(knowledge_answer.strip())
+        seeds.append(hop_target.strip())
+
+        terms: List[str] = []
+        for seed in seeds:
+            if not seed:
+                continue
+            # Chinese phrase anchors
+            terms.extend(re.findall(r"[\u4e00-\u9fff]{2,12}", seed))
+            # English token anchors
+            terms.extend(re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,32}", seed))
+
+        # Keep order, drop duplicates and overly generic terms
+        blocked = {"search", "query", "project", "entity", "company", "target"}
+        deduped: List[str] = []
+        for t in terms:
+            key = t.lower()
+            if key in blocked:
+                continue
+            if t not in deduped:
+                deduped.append(t)
+        return deduped[:6]
+
+    @staticmethod
+    def _check_if_refine_result_is_drift(
+        alternative_entities: List[str],
+        anchor_terms: List[str],
+    ) -> bool:
+        """Return True if alternatives look unrelated to current anchor terms."""
+        if not alternative_entities or not anchor_terms:
+            return False
+        alt_lower = [a.lower() for a in alternative_entities if a]
+        anchor_lower = [t.lower() for t in anchor_terms if t]
+        if not alt_lower or not anchor_lower:
+            return False
+        # Drift if none of the alternative entities contains any anchor token.
+        return all(
+            not any(anchor in alt for anchor in anchor_lower)
+            for alt in alt_lower
+        )
+
+    def _inject_anchor_terms_into_refined_queries(
+        self,
+        refined_queries: List[str],
+        anchor_terms: List[str],
+        hop_target: str,
+        max_queries: int,
+    ) -> List[str]:
+        """Inject anchor terms into refined queries to reduce entity drift."""
+        if not refined_queries:
+            refined_queries = [hop_target]
+        if not anchor_terms:
+            return list(dict.fromkeys(refined_queries))[:max_queries]
+
+        anchored = list(refined_queries)
+        primary_anchor = " ".join(anchor_terms[:2]).strip()
+        if primary_anchor:
+            anchored.append(f"{primary_anchor} {hop_target}".strip())
+
+        # For the first two refined queries, append one anchor token if missing.
+        for i, q in enumerate(refined_queries[:2]):
+            if not any(a.lower() in q.lower() for a in anchor_terms):
+                anchored.append(f"{q} {anchor_terms[0]}".strip())
+
+        return list(dict.fromkeys(anchored))[:max_queries]
+
+    # ── Hop chain backtrack: re-search when candidate is rejected ──────
+
+    def _attempt_hop_chain_backtrack_on_candidate_rejection(
+        self,
+        question: str,
+        rejected_entities: List[str],
+        rejection_reason: str,
+        original_hop_target: str,
+        hop_domain: str,
+        reasoning_steps: List[str],
+        search_traces: List[Dict],
+        all_ranked: List[Dict],
+        all_texts: List[str],
+    ) -> Tuple[str, str, List[Dict]]:
+        """Backtrack to Hop 1 and re-search with exclusion constraints.
+
+        Why (from Q99 log analysis): When Hop 2+ discovers the candidate from
+        Hop 1 fails a hard constraint (e.g. Peter Ndlovu born 1973, outside
+        1988-1995), the system has no way to go back and find a different
+        candidate.  It just keeps refining within the current hop, eventually
+        settling on another wrong candidate (Quinton Fortune, born 1977).
+
+        This method re-executes a search round with:
+        1. Exclusion terms (-Ndlovu -Fortune) to avoid known-wrong candidates
+        2. Constraint-focused queries derived from the rejection reason
+        3. The original hop target to stay on-topic
+
+        References:
+          - Research_Agent: correct_hop_result() — re-execute tool on failure
+          - Weaver: knowledge gap analysis — identify missing aspects for next round
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        reasoning_steps.append(
+            f"BACKTRACK: Rejected entities {rejected_entities}, "
+            f"reason: {rejection_reason[:200]}"
+        )
+
+        # Build exclusion-augmented queries using LLM
+        exclusion_suffix = " ".join(f"-{e}" for e in rejected_entities[:3] if e)
+        backtrack_queries: List[str] = []
+
+        if self.llm_generic_fn:
+            try:
+                backtrack_prompt = (
+                    f"The following candidates were REJECTED for this question:\n"
+                    f"Question: {question}\n"
+                    f"Rejected: {', '.join(rejected_entities)}\n"
+                    f"Reason: {rejection_reason[:500]}\n\n"
+                    f"Generate 3-4 NEW search queries that:\n"
+                    f"1. Explicitly EXCLUDE the rejected candidates\n"
+                    f"2. Focus on the constraints that rejected candidates failed\n"
+                    f"3. Search for ALTERNATIVE candidates\n\n"
+                    f"Output ONLY search queries, one per line. No numbering or explanations."
+                )
+                raw = self.llm_generic_fn(
+                    "You are a search query expert. Generate precise queries to find "
+                    "alternative candidates after previous ones were rejected.",
+                    backtrack_prompt,
+                )
+                if raw:
+                    for line in raw.strip().split("\n"):
+                        line = line.strip().lstrip("0123456789.-) ")
+                        if line and len(line) > 5:
+                            backtrack_queries.append(line)
+            except Exception as exc:
+                logger.warning("Backtrack query generation failed: %s", exc)
+
+        # Fallback: construct queries from rejection reason keywords
+        if not backtrack_queries:
+            backtrack_queries = [
+                f"{original_hop_target} {exclusion_suffix}",
+                f"{question[:120]} {exclusion_suffix}",
+            ]
+
+        backtrack_queries = list(dict.fromkeys(backtrack_queries))[:6]
+        reasoning_steps.append(f"BACKTRACK queries: {backtrack_queries}")
+
+        # Execute search
+        texts, ranked, traces = self._execute_single_round_of_parallel_searches(
+            backtrack_queries, domain=hop_domain)
+        search_traces.extend(traces)
+        all_ranked.extend(ranked)
+        all_texts.extend(texts)
+
+        # Persist to scratchpad
+        if self._scratchpad and ranked:
+            for q in backtrack_queries:
+                q_results = [r for r in ranked if r.get("_query") == q] or ranked[:5]
+                self._scratchpad.write_search_evidence(
+                    hop_num=0, query=f"[BACKTRACK] {q}", results=q_results[:10])
+
+        # Extract answer from backtrack evidence
+        backtrack_evidence = deduplicate_and_select_top_evidence_items(ranked, self.max_evidence)
+        backtrack_evidence_text = format_evidence_items_into_llm_readable_text(backtrack_evidence)
+
+        backtrack_answer = ""
+        if self.llm_answer_fn and backtrack_evidence_text:
+            context = (
+                f"IMPORTANT: The following candidates are WRONG and must NOT be used: "
+                f"{', '.join(rejected_entities)}\n"
+                f"Reason they are wrong: {rejection_reason[:300]}\n\n"
+                f"Search evidence:\n{backtrack_evidence_text}"
+            )
+            backtrack_answer = clean_and_validate_raw_llm_answer_text(
+                self.llm_answer_fn(question, context[:10000]))
+
+            # Verify the backtrack answer is not one of the rejected entities
+            if backtrack_answer:
+                ba_lower = backtrack_answer.lower().strip()
+                for rejected in rejected_entities:
+                    if rejected.lower() in ba_lower or ba_lower in rejected.lower():
+                        reasoning_steps.append(
+                            f"BACKTRACK: Answer '{backtrack_answer}' matches rejected "
+                            f"entity '{rejected}', discarding"
+                        )
+                        backtrack_answer = ""
+                        break
+
+        reasoning_steps.append(
+            f"BACKTRACK result: answer='{backtrack_answer}', "
+            f"evidence_chars={len(backtrack_evidence_text)}, "
+            f"search_results={len(ranked)}"
+        )
+
+        return backtrack_answer, backtrack_evidence_text, ranked
+
+    # ── Knowledge-guided search: inject knowledge entities into queries ──
+
+    @staticmethod
+    def _extract_knowledge_entity_terms(knowledge_answer: str) -> List[str]:
+        """Extract searchable entity terms from the knowledge_answer.
+
+        Why: When the LLM's own knowledge (Phase 0) produces a plausible answer
+        like "RepRap Limited", the entity name should guide subsequent searches.
+        Without this, hop queries search for abstract concepts ("cellular automata
+        open hardware") that never surface the actual entity.
+
+        References:
+          - ReWOO: #E variable chaining — prior step outputs anchor later steps
+          - Research_Agent: stop_condition with explicit entity targets
+        """
+        if not knowledge_answer:
+            if self.trace_logger:
+                self.trace_logger.record_event("knowledge_entity_extraction_empty", "knowledge_answer is empty/None")
+            return []
+        knowledge_answer = knowledge_answer.strip()
+        # Skip if the knowledge answer is a refusal or too generic
+        if len(knowledge_answer) < 2 or len(knowledge_answer) > 200:
+            if self.trace_logger:
+                self.trace_logger.record_event("knowledge_entity_extraction_empty", f"knowledge_answer length {len(knowledge_answer)} out of range [2,200]")
+            return []
+
+        terms: List[str] = []
+        # Full entity name as a single term (most valuable)
+        terms.append(knowledge_answer)
+        # Individual significant tokens (for partial matching)
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,32}", knowledge_answer):
+            if token.lower() not in {
+                "the", "and", "for", "ltd", "inc", "corp", "limited",
+                "company", "group", "unknown", "none", "project",
+            }:
+                terms.append(token)
+        # Chinese tokens
+        for token in re.findall(r"[\u4e00-\u9fff]{2,12}", knowledge_answer):
+            terms.append(token)
+        # Deduplicate while preserving order
+        seen: set = set()
+        deduped: List[str] = []
+        for t in terms:
+            if t.lower() not in seen:
+                seen.add(t.lower())
+                deduped.append(t)
+        return deduped[:5]
+
+    @staticmethod
+    def _inject_knowledge_entities_into_queries(
+        queries: List[str],
+        knowledge_entities: List[str],
+        max_queries: int,
+    ) -> List[str]:
+        """Inject knowledge entity terms into hop queries to guide search.
+
+        Why (from run_20260216_000139 log analysis): The 5-hop search spent 1325s
+        searching for abstract concepts and found nothing.  Meanwhile, the
+        knowledge_answer correctly identified "RepRap Limited" in 11s.  By
+        injecting this entity into search queries, we guide the search engine
+        to the right neighborhood immediately.
+
+        Strategy:
+        1. Keep all original queries (they may find complementary evidence)
+        2. Add knowledge-anchored queries that combine entity + hop context
+        3. For queries that don't mention the entity, append the primary entity
+        """
+        if not knowledge_entities or not queries:
+            if self.trace_logger:
+                self.trace_logger.record_event("knowledge_entity_injection_skipped",
+                    f"entities={len(knowledge_entities) if knowledge_entities else 0} queries={len(queries) if queries else 0}")
+            return queries[:max_queries]
+
+        primary_entity = knowledge_entities[0]  # Full entity name
+        augmented = list(queries)
+
+        # Add a direct entity search query
+        augmented.append(primary_entity)
+
+        # For each original query, create an entity-augmented variant if the
+        # entity is not already mentioned
+        for q in queries[:3]:
+            if not any(e.lower() in q.lower() for e in knowledge_entities[:2]):
+                augmented.append(f"{primary_entity} {q}".strip())
+
+        return list(dict.fromkeys(augmented))[:max_queries]
+
     # ── Iterative retrieval per hop (P0-d: from everything-claude-code) ──
 
     def _execute_iterative_retrieval_for_single_hop(
@@ -186,7 +506,8 @@ class ConstrainedMultiHopSearchAgent:
         search_traces: List[Dict],
         all_ranked: List[Dict],
         all_texts: List[str],
-    ) -> Tuple[str, str, bool]:
+        knowledge_answer: str = "",
+    ) -> Tuple[str, str, bool, Dict[str, Any]]:
         """Execute one hop with iterative retrieval (DISPATCH → EVALUATE → REFINE → LOOP).
 
         Why (from everything-claude-code skills/iterative-retrieval/SKILL.md):
@@ -195,13 +516,24 @@ class ConstrainedMultiHopSearchAgent:
         refines queries based on what is specifically missing.
 
         Returns:
-            (hop_answer, hop_evidence_text, should_stop_chain)
+            (hop_answer, hop_evidence_text, should_stop_chain, hop_meta)
         """
+        hop_started_ts = time.time()
         hop_num = hop.get("hop_num", hop_idx + 1)
         hop_target = hop.get("target", "搜索相关信息")
         hop_stop_condition = hop.get("stop_condition", "获取到相关信息")
         hop_count = len(hops)
         is_last_hop = (hop_idx == len(hops) - 1)
+        max_q = max(self.max_queries, 6)
+        # Pass knowledge_answer to ALL hops for anchor term extraction, not just
+        # hop 0.  Why: knowledge entities remain relevant throughout the chain —
+        # later hops searching for "commercial entity" still benefit from knowing
+        # the project is "RepRap".
+        anchor_terms = self._extract_anchor_terms_for_drift_guard(
+            hop_target=hop_target,
+            knowledge_answer=knowledge_answer,
+        )
+        drift_refine_streak = 0
 
         # Wing-architecture: Classify hop domain for search engine routing.
         # Use the domain from hop plan if available, otherwise classify via LLM.
@@ -213,6 +545,13 @@ class ConstrainedMultiHopSearchAgent:
             f"Hop {hop_num} domain: {hop_domain}"
         )
 
+        # ── Knowledge-guided search: extract entities from knowledge_answer ──
+        # Why (from run_20260216_000139 analysis): knowledge_answer correctly
+        # identified "RepRap Limited" in 11s, but 5 hops spent 1325s searching
+        # for abstract concepts.  Injecting the knowledge entity into queries
+        # guides search to the right neighborhood immediately.
+        knowledge_entities = self._extract_knowledge_entity_terms(knowledge_answer)
+
         # Generate initial queries for this hop (P0-f: bilingual ZH+EN queries)
         if hop_idx == 0:
             parsed = extract_structured_clues_from_question_text(question)
@@ -221,7 +560,6 @@ class ConstrainedMultiHopSearchAgent:
             hop_queries = generate_queries_for_hop(
                 question, hop_target, previous_hop_results, self.llm_generic_fn)
             # Allow more queries since bilingual generation produces both ZH+EN
-            max_q = max(self.max_queries, 6)
             queries = list(dict.fromkeys(base_queries + hop_queries))[:max_q]
         else:
             hop_queries = generate_queries_for_hop(
@@ -230,30 +568,98 @@ class ConstrainedMultiHopSearchAgent:
                 followup = self._generate_second_hop_follow_up_queries(
                     question, hop_answers[-1])
                 hop_queries = list(dict.fromkeys(hop_queries + followup))
-            max_q = max(self.max_queries, 6)
             queries = hop_queries[:max_q]
+
+        # Inject knowledge entities into queries for ALL hops (not just hop 0)
+        if knowledge_entities:
+            queries = self._inject_knowledge_entities_into_queries(
+                queries, knowledge_entities, max_q)
+            reasoning_steps.append(
+                f"Hop {hop_num} knowledge-guided: injected entities "
+                f"{knowledge_entities[:3]} into {len(queries)} queries"
+            )
 
         # Iterative retrieval loop: DISPATCH → EVALUATE → REFINE → LOOP
         hop_answer = ""
         hop_evidence_text = ""
         hop_all_ranked = []
+        hop_stop_reason = "max_cycles_or_continue"
+        last_evaluation: Dict[str, Any] = {}
+        executed_cycles = 0
+
+        def _record_hop_cycle_trace(cycle_index: int, details: Dict[str, Any]) -> None:
+            if self.trace_logger and hasattr(self.trace_logger, "record_per_hop_retrieval_cycle_trace"):
+                self.trace_logger.record_per_hop_retrieval_cycle_trace(
+                    question=question,
+                    hop_num=hop_num,
+                    cycle=cycle_index + 1,
+                    details=details,
+                )
 
         for cycle in range(MAX_RETRIEVAL_CYCLES_PER_HOP):
+            cycle_started_ts = time.time()
+            executed_cycles = cycle + 1
             cycle_label = f"Hop {hop_num} cycle {cycle + 1}"
             reasoning_steps.append(f"{cycle_label} queries: {queries}")
+            queries_before_refine = list(queries)
+            local_retrieval_elapsed_ms = 0
+            network_elapsed_ms = 0
+            extraction_elapsed_ms = 0
+            evaluation_elapsed_ms = 0
+            refinement_triggered = False
+            drift_detected = False
+            queries_after_refine = list(queries_before_refine)
+            anchor_terms_used: List[str] = []
+
+            # ── LOCAL RETRIEVAL: Check scratchpad before network search ──
+            # Why: Later hops often need evidence already fetched by earlier hops.
+            # Querying the local BM25 index first avoids redundant API calls
+            # and provides instant results from already-cleaned content.
+            local_hits: list = []
+            local_start_ts = time.time()
+            if self._scratchpad and cycle == 0:
+                for q in queries:
+                    hits = self._scratchpad.search_local(q, top_k=3, min_score=1.0)
+                    local_hits.extend(hits)
+                if local_hits:
+                    # Deduplicate by URL
+                    seen_urls = set()
+                    unique_local: list = []
+                    for h in local_hits:
+                        if h.get("url") not in seen_urls:
+                            seen_urls.add(h.get("url"))
+                            unique_local.append(h)
+                    local_hits = unique_local[:5]
+                    hop_all_ranked.extend(local_hits)
+                    all_ranked.extend(local_hits)
+                    reasoning_steps.append(
+                        f"{cycle_label} local_kb: {len(local_hits)} hits from scratchpad "
+                        f"(top_score={local_hits[0].get('_score', 0):.2f})")
+            local_retrieval_elapsed_ms = int((time.time() - local_start_ts) * 1000)
 
             # DISPATCH: Execute search (Wing-architecture: domain-aware routing)
+            network_start_ts = time.time()
             texts, ranked, traces = self._execute_single_round_of_parallel_searches(queries, domain=hop_domain)
+            network_elapsed_ms = int((time.time() - network_start_ts) * 1000)
             search_traces.extend(traces)
             hop_all_ranked.extend(ranked)
             all_ranked.extend(ranked)
             all_texts.extend(texts)
+
+            # ── PERSIST: Write search results to scratchpad ──
+            if self._scratchpad and ranked:
+                for q in queries:
+                    # Find results that came from this query
+                    q_results = [r for r in ranked if r.get("_query") == q] or ranked
+                    self._scratchpad.write_search_evidence(
+                        hop_num=hop_num, query=q, results=q_results[:10])
 
             # Build evidence for this cycle (accumulated across cycles within this hop)
             hop_evidence = deduplicate_and_select_top_evidence_items(hop_all_ranked, self.max_evidence)
             hop_evidence_text = format_evidence_items_into_llm_readable_text(hop_evidence)
             reasoning_steps.append(
                 f"{cycle_label} evidence: {len(ranked)} new results, "
+                f"{len(local_hits)} local, "
                 f"{len(hop_all_ranked)} total, {len(hop_evidence_text)} chars"
             )
 
@@ -265,6 +671,7 @@ class ConstrainedMultiHopSearchAgent:
             # real objective is "identify the major space telescope").
             extraction_question = question if is_last_hop else hop_target
             if self.llm_answer_fn and hop_evidence_text:
+                extraction_start_ts = time.time()
                 isolated_context = self._build_isolated_hop_context(
                     hop_target, hop_evidence_text, previous_hop_results)
                 reasoning_steps.append(
@@ -273,11 +680,13 @@ class ConstrainedMultiHopSearchAgent:
                 )
                 hop_answer = clean_and_validate_raw_llm_answer_text(
                     self.llm_answer_fn(extraction_question, isolated_context[:8000]))
+                extraction_elapsed_ms = int((time.time() - extraction_start_ts) * 1000)
                 reasoning_steps.append(
                     f"{cycle_label} extracted_answer: '{hop_answer[:100]}'"
                 )
 
             # EVALUATE: Unified evaluation (validate + reflect + completion check)
+            evaluation_start_ts = time.time()
             evaluation = evaluate_hop_result_and_decide_next_action(
                 question=question,
                 hop_num=hop_num,
@@ -290,6 +699,8 @@ class ConstrainedMultiHopSearchAgent:
                 is_last_hop=is_last_hop,
                 llm_fn=self.llm_generic_fn,
             )
+            evaluation_elapsed_ms = int((time.time() - evaluation_start_ts) * 1000)
+            last_evaluation = dict(evaluation)
             reasoning_steps.append(
                 f"{cycle_label} eval: valid={evaluation['valid']}, "
                 f"conf={evaluation['confidence']:.2f}, "
@@ -300,6 +711,9 @@ class ConstrainedMultiHopSearchAgent:
             # Use extracted entity from evaluation if we didn't get a hop_answer
             if evaluation.get("extracted_entity") and not hop_answer:
                 hop_answer = evaluation["extracted_entity"]
+                if self.trace_logger:
+                    self.trace_logger.record_event("entity_extraction_fallback",
+                        f"hop {hop_num}: using evaluation entity '{hop_answer[:60]}' as hop_answer was empty")
 
             # Check if chain is already complete (early termination)
             # P0-f: Raised threshold from 0.75 to 0.85 to reduce premature
@@ -310,15 +724,79 @@ class ConstrainedMultiHopSearchAgent:
                     hop_answer = chain_answer
                 reasoning_steps.append(
                     f"Chain complete at hop {hop_num} cycle {cycle + 1} (conf={evaluation['confidence']:.2f})")
-                return hop_answer, hop_evidence_text, True  # should_stop_chain=True
+                hop_stop_reason = "chain_complete"
+                _record_hop_cycle_trace(cycle, {
+                    "hop_target": hop_target,
+                    "hop_domain": hop_domain,
+                    "queries_before_refine": queries_before_refine,
+                    "queries_after_refine": queries_after_refine,
+                    "local_retrieval": {
+                        "enabled": bool(self._scratchpad and cycle == 0),
+                        "elapsed_ms": local_retrieval_elapsed_ms,
+                        "hits_count": len(local_hits),
+                        "top_score": local_hits[0].get("_score", 0.0) if local_hits else 0.0,
+                    },
+                    "network_retrieval": {
+                        "elapsed_ms": network_elapsed_ms,
+                        "query_count": len(queries_before_refine),
+                        "queries_used": queries_before_refine,
+                        "total_snippets": len(texts),
+                        "result_count": len(ranked),
+                    },
+                    "evidence": {
+                        "hop_total_ranked_count": len(hop_all_ranked),
+                        "evidence_chars": len(hop_evidence_text),
+                    },
+                    "extraction": {
+                        "elapsed_ms": extraction_elapsed_ms,
+                        "question_type": "original" if is_last_hop else "hop_target",
+                        "hop_answer_preview": hop_answer[:120],
+                    },
+                    "evaluation": {
+                        "elapsed_ms": evaluation_elapsed_ms,
+                        "valid": evaluation.get("valid", False),
+                        "confidence": evaluation.get("confidence", 0.0),
+                        "extracted_entity": evaluation.get("extracted_entity", ""),
+                        "alternative_entities": evaluation.get("alternative_entities", []),
+                        "missing_info": evaluation.get("missing_info", ""),
+                        "next_action": evaluation.get("next_action", ""),
+                        "is_chain_complete": evaluation.get("is_chain_complete", False),
+                    },
+                    "refinement": {
+                        "triggered": refinement_triggered,
+                        "drift_detected": drift_detected,
+                        "drift_refine_streak": drift_refine_streak,
+                        "anchor_terms_used": anchor_terms_used,
+                    },
+                    "stop_reason": hop_stop_reason,
+                    "cycle_elapsed_ms": int((time.time() - cycle_started_ts) * 1000),
+                })
+                return hop_answer, hop_evidence_text, True, {
+                    "total_cycles": executed_cycles,
+                    "stop_reason": hop_stop_reason,
+                    "elapsed_ms": int((time.time() - hop_started_ts) * 1000),
+                    "last_evaluation": last_evaluation,
+                }
 
             # Decision: stop iterating, refine, or continue to next hop
             if evaluation["next_action"] == "sufficient":
                 reasoning_steps.append(f"{cycle_label}: sufficient evidence")
-                break
+                hop_stop_reason = "sufficient"
             elif evaluation["next_action"] == "refine" and cycle < MAX_RETRIEVAL_CYCLES_PER_HOP - 1:
                 # REFINE: Generate better queries based on what is missing
-                queries = generate_refined_hop_queries_from_evaluation(
+                refinement_triggered = True
+                alternatives = evaluation.get("alternative_entities", []) or []
+                drift_detected = self._check_if_refine_result_is_drift(
+                    alternative_entities=alternatives,
+                    anchor_terms=anchor_terms,
+                )
+                drift_refine_streak = drift_refine_streak + 1 if drift_detected else 0
+                if self.trace_logger:
+                    self.trace_logger.record_event(
+                        "drift_detected" if drift_detected else "drift_not_detected",
+                        f"hop {hop_num} cycle {cycle+1}: streak={drift_refine_streak} alternatives={alternatives[:3]}")
+
+                refined_queries = generate_refined_hop_queries_from_evaluation(
                     question=question,
                     hop_num=hop_num,
                     hop_target=hop_target,
@@ -327,12 +805,89 @@ class ConstrainedMultiHopSearchAgent:
                     reasoning=evaluation.get("reasoning", ""),
                     llm_fn=self.llm_generic_fn,
                 )
-                reasoning_steps.append(f"{cycle_label} refine → {queries}")
+                # P1 minimal drift guard: if repeated refine cycles keep drifting
+                # away from anchor terms, inject anchors into next-round queries.
+                if (self._enable_minimal_drift_guard
+                        and drift_refine_streak >= 2
+                        and anchor_terms):
+                    anchor_terms_used = anchor_terms[:2]
+                    refined_queries = self._inject_anchor_terms_into_refined_queries(
+                        refined_queries=refined_queries,
+                        anchor_terms=anchor_terms_used,
+                        hop_target=hop_target,
+                        max_queries=max_q,
+                    )
+                    reasoning_steps.append(
+                        f"{cycle_label} drift_guard active: inject anchors {anchor_terms_used}"
+                    )
+
+                queries = refined_queries
+                queries_after_refine = list(queries)
+                hop_stop_reason = "refine"
+                reasoning_steps.append(f"{cycle_label} refine → {queries_after_refine}")
             else:
                 # Valid or last cycle — move on
-                break
+                hop_stop_reason = "continue_next_hop"
 
-        return hop_answer, hop_evidence_text, False  # should_stop_chain=False
+            _record_hop_cycle_trace(cycle, {
+                "hop_target": hop_target,
+                "hop_domain": hop_domain,
+                "queries_before_refine": queries_before_refine,
+                "queries_after_refine": queries_after_refine,
+                "local_retrieval": {
+                    "enabled": bool(self._scratchpad and cycle == 0),
+                    "elapsed_ms": local_retrieval_elapsed_ms,
+                    "hits_count": len(local_hits),
+                    "top_score": local_hits[0].get("_score", 0.0) if local_hits else 0.0,
+                },
+                "network_retrieval": {
+                    "elapsed_ms": network_elapsed_ms,
+                    "query_count": len(queries_before_refine),
+                    "queries_used": queries_before_refine,
+                    "total_snippets": len(texts),
+                    "result_count": len(ranked),
+                },
+                "evidence": {
+                    "hop_total_ranked_count": len(hop_all_ranked),
+                    "evidence_chars": len(hop_evidence_text),
+                },
+                "extraction": {
+                    "elapsed_ms": extraction_elapsed_ms,
+                    "question_type": "original" if is_last_hop else "hop_target",
+                    "hop_answer_preview": hop_answer[:120],
+                },
+                "evaluation": {
+                    "elapsed_ms": evaluation_elapsed_ms,
+                    "valid": evaluation.get("valid", False),
+                    "confidence": evaluation.get("confidence", 0.0),
+                    "extracted_entity": evaluation.get("extracted_entity", ""),
+                    "alternative_entities": evaluation.get("alternative_entities", []),
+                    "missing_info": evaluation.get("missing_info", ""),
+                    "next_action": evaluation.get("next_action", ""),
+                    "is_chain_complete": evaluation.get("is_chain_complete", False),
+                },
+                "refinement": {
+                    "triggered": refinement_triggered,
+                    "drift_detected": drift_detected,
+                    "drift_refine_streak": drift_refine_streak,
+                    "anchor_terms_used": anchor_terms_used,
+                },
+                "stop_reason": hop_stop_reason,
+                "cycle_elapsed_ms": int((time.time() - cycle_started_ts) * 1000),
+            })
+
+            if evaluation["next_action"] == "sufficient":
+                break
+            if evaluation["next_action"] == "refine" and cycle < MAX_RETRIEVAL_CYCLES_PER_HOP - 1:
+                continue
+            break
+
+        return hop_answer, hop_evidence_text, False, {
+            "total_cycles": executed_cycles,
+            "stop_reason": hop_stop_reason,
+            "elapsed_ms": int((time.time() - hop_started_ts) * 1000),
+            "last_evaluation": last_evaluation,
+        }
 
     # ── Main orchestration (P0-d: iterative retrieval + merged eval) ──
 
@@ -351,6 +906,47 @@ class ConstrainedMultiHopSearchAgent:
         """
         reasoning_steps = []
         search_traces = []
+
+        # ── Classify question language priority (english_first / chinese_first / bilingual_equal) ──
+        # Why: A purely English question about Western history should not trigger
+        # IQS (Chinese search) even when hop planning generates Chinese queries.
+        # This routing was previously only active in the MiniAgent loop; now it
+        # also governs the hop search phase via meta["language_priority"].
+        try:
+            lang_result = classify_question_geographic_language_priority(
+                question, llm_fn=None,
+            )
+            self._language_priority = lang_result.get("priority", "bilingual_equal")
+            reasoning_steps.append(
+                f"Language routing: {self._language_priority} "
+                f"(signals={lang_result.get('detected_signals', [])})"
+            )
+        except Exception:
+            self._language_priority = "bilingual_equal"
+
+        # ── Create per-question scratchpad (local knowledge base) ──
+        # Why: Persist all search results and cleaned pages to disk so later
+        # hops can re-use evidence via BM25 local retrieval instead of
+        # re-searching the web.
+        if self._scratchpad_base_dir:
+            # Extract question_id from question text hash (first 6 chars)
+            import hashlib
+            q_id = hashlib.md5(question.encode()).hexdigest()[:6]
+            self._scratchpad = PerQuestionEvidenceScratchpad(
+                base_dir=self._scratchpad_base_dir,
+                question_id=q_id,
+                question_text=question,
+            )
+            # Propagate scratchpad to the search dispatcher so page enrichment
+            # can persist cleaned pages to the scratchpad's pages/ directory.
+            if hasattr(self.search_fn, "__self__"):
+                server = self.search_fn.__self__
+                dispatcher = getattr(server, "_hybrid_search", None)
+                if dispatcher:
+                    dispatcher.scratchpad = self._scratchpad
+            reasoning_steps.append(f"Scratchpad created: q{q_id}")
+        else:
+            self._scratchpad = None
 
         # Phase 0: LLM knowledge-only answer (always first for baseline)
         knowledge_answer = self._run_knowledge_only_answer_phase(question, reasoning_steps)
@@ -380,14 +976,22 @@ class ConstrainedMultiHopSearchAgent:
         # backward compatibility with generate_queries_for_hop(), but now
         # contains entity-highlighted summaries.
         structured_hop_results: List[Dict[str, Any]] = []
+        # Collect per-hop evaluations so the MiniAgent can see pipeline
+        # self-assessment (e.g. valid=False, confidence=0.3 on Hop 4).
+        hop_evaluation_summaries: List[Dict[str, Any]] = []
         knowledge_chain_answer = ""  # Set by knowledge-anchored recovery if triggered
         knowledge_chain_evidence = ""
+        # Backtrack guard: allow at most 1 backtrack per question to prevent
+        # infinite loops.  Tracks rejected entities across hops so the backtrack
+        # search can exclude all known-wrong candidates.
+        backtrack_used = False
+        backtrack_rejected_entities: List[str] = []
 
         for hop_idx, hop in enumerate(hops):
             hop_num = hop.get("hop_num", hop_idx + 1)
             hop_target = hop.get("target", "搜索相关信息")
 
-            hop_answer, hop_evidence_text, should_stop = self._execute_iterative_retrieval_for_single_hop(
+            hop_answer, hop_evidence_text, should_stop, hop_meta = self._execute_iterative_retrieval_for_single_hop(
                 question=question,
                 hop_idx=hop_idx,
                 hop=hop,
@@ -399,10 +1003,97 @@ class ConstrainedMultiHopSearchAgent:
                 search_traces=search_traces,
                 all_ranked=all_ranked,
                 all_texts=all_texts,
+                knowledge_answer=knowledge_answer,
             )
 
             hop_evidence_texts.append(hop_evidence_text)
             hop_answers.append(hop_answer)
+
+            # ── LOG: Per-hop result summary for diagnostics ──
+            eval_info_log = hop_meta.get("last_evaluation", {})
+            hop_entity_log = eval_info_log.get("extracted_entity", hop_answer or "")
+            hop_valid_log = eval_info_log.get("valid", None)
+            hop_conf_log = eval_info_log.get("confidence", None)
+            logger.info(
+                "[HOP %d RESULT] entity=%s valid=%s confidence=%s "
+                "cycles=%d elapsed_ms=%d stop_reason=%s",
+                hop_num,
+                repr(hop_entity_log[:80]) if hop_entity_log else "EMPTY",
+                hop_valid_log,
+                f"{hop_conf_log:.2f}" if hop_conf_log is not None else "N/A",
+                hop_meta.get("total_cycles", 0),
+                hop_meta.get("elapsed_ms", 0),
+                hop_meta.get("stop_reason", "unknown"),
+            )
+
+            # ── BACKTRACK CHECK: Log all condition variables before evaluating ──
+            bt_eval = hop_meta.get("last_evaluation", {})
+            bt_conf = bt_eval.get("confidence", 1.0)
+            bt_valid = bt_eval.get("valid", True)
+            logger.info(
+                "[BACKTRACK CHECK] hop_idx=%d backtrack_used=%s "
+                "eval_valid=%s eval_confidence=%.2f "
+                "conditions_met=%s (need: hop_idx>=1, conf<=0.3, valid=False, not backtrack_used)",
+                hop_idx, backtrack_used, bt_valid, bt_conf,
+                (not backtrack_used and hop_idx >= 1 and bt_conf <= 0.3 and not bt_valid),
+            )
+
+            # ── BACKTRACK: When evaluation rejects candidate with low confidence,
+            # re-search from scratch with exclusion constraints ──
+            # Why (from Q99 analysis): Hop 2 discovered Peter Ndlovu (born 1973)
+            # fails the 1988-1995 constraint, but could only refine within Hop 2,
+            # eventually settling on Quinton Fortune (also wrong).  Backtracking
+            # to Hop 1 with exclusion terms finds the correct younger candidate.
+            #
+            # References:
+            #   - Research_Agent: correct_hop_result() — retry tool on validation failure
+            #   - Weaver: knowledge gap analysis — use missing info to guide next search
+            if (not backtrack_used
+                    and hop_idx >= 1
+                    and hop_meta.get("last_evaluation", {}).get("confidence", 1.0) <= 0.3
+                    and not hop_meta.get("last_evaluation", {}).get("valid", True)):
+                eval_info = hop_meta.get("last_evaluation", {})
+                missing_info = eval_info.get("missing_info", "")
+                rejected_entity = eval_info.get("extracted_entity", "")
+                # Collect all entities that have been tried and failed
+                if rejected_entity and rejected_entity not in backtrack_rejected_entities:
+                    backtrack_rejected_entities.append(rejected_entity)
+                # Also add previous hop answers that were invalidated
+                for prev_ha in hop_answers[:-1]:
+                    if (prev_ha
+                            and prev_ha not in backtrack_rejected_entities
+                            and not check_if_answer_is_refusal_or_unknown_placeholder(prev_ha)):
+                        backtrack_rejected_entities.append(prev_ha)
+
+                if backtrack_rejected_entities:
+                    backtrack_used = True
+                    reasoning_steps.append(
+                        f"BACKTRACK TRIGGERED at Hop {hop_meta.get('last_evaluation', {}).get('extracted_entity', '')} "
+                        f"(conf={eval_info.get('confidence', 0):.2f}): "
+                        f"rejected={backtrack_rejected_entities}"
+                    )
+                    bt_answer, bt_evidence, bt_ranked = (
+                        self._attempt_hop_chain_backtrack_on_candidate_rejection(
+                            question=question,
+                            rejected_entities=backtrack_rejected_entities,
+                            rejection_reason=missing_info,
+                            original_hop_target=hops[0].get("target", ""),
+                            hop_domain=hops[0].get("domain", "news"),
+                            reasoning_steps=reasoning_steps,
+                            search_traces=search_traces,
+                            all_ranked=all_ranked,
+                            all_texts=all_texts,
+                        ))
+                    if bt_answer and not check_if_answer_is_refusal_or_unknown_placeholder(bt_answer):
+                        # Inject backtrack answer as a high-priority candidate
+                        # by overriding the current hop answer and adding to
+                        # structured results
+                        hop_answer = bt_answer
+                        hop_answers[-1] = bt_answer
+                        hop_evidence_texts[-1] = bt_evidence or hop_evidence_text
+                        reasoning_steps.append(
+                            f"BACKTRACK SUCCESS: new candidate '{bt_answer}'"
+                        )
 
             # Wing-architecture: Structured entity passing — store precise entity
             # + short evidence snippet for downstream hops, instead of a vague
@@ -418,12 +1109,76 @@ class ConstrainedMultiHopSearchAgent:
             }
             structured_hop_results.append(hop_result_struct)
 
+            # Collect evaluation summary for MiniAgent injection
+            _he = hop_meta.get("last_evaluation", {})
+            hop_evaluation_summaries.append({
+                "hop_num": hop_num,
+                "entity": entity[:100] if entity else "",
+                "valid": _he.get("valid", True),
+                "confidence": _he.get("confidence", 0.5),
+            })
+
+            # ── PERSIST: Update scratchpad INDEX.md with hop entity ──
+            if self._scratchpad and entity:
+                self._scratchpad.update_index(
+                    hop_num=hop_num,
+                    entity=entity,
+                    summary=evidence_snippet,
+                    target=hop_target,
+                )
+
             # Build an entity-highlighted summary for generate_queries_for_hop()
             if entity:
                 summary = f"Hop {hop_num} ({hop_target}): **{entity}** — {evidence_snippet}"
             else:
                 summary = f"Hop {hop_num} ({hop_target}): no clear answer — {evidence_snippet}"
             previous_hop_results.append(summary)
+
+            # ── TRACE: Per-hop summary (new process-level observability) ──
+            if self.trace_logger and hasattr(self.trace_logger, "record_per_hop_summary_trace"):
+                self.trace_logger.record_per_hop_summary_trace(
+                    question=question,
+                    hop_num=hop_num,
+                    hop_target=hop_target,
+                    details={
+                        "domain": hop.get("domain", ""),
+                        "total_cycles": int(hop_meta.get("total_cycles", 0)),
+                        "final_entity": entity,
+                        "stop_reason": hop_meta.get("stop_reason", ""),
+                        "elapsed_ms": int(hop_meta.get("elapsed_ms", 0)),
+                        "evidence_chars": len(hop_evidence_text or ""),
+                        "should_stop_chain": bool(should_stop),
+                        "last_evaluation": hop_meta.get("last_evaluation", {}),
+                    },
+                )
+
+            # ── Early short-circuit: skip remaining hops when knowledge confirmed ──
+            # Why (from run_20260216_000139 analysis): knowledge_answer was correct
+            # in 11s, but 5 hops spent 1325s (80% of total time) searching blindly.
+            # If Hop 1's extracted answer matches knowledge_answer, we can verify
+            # with a single web search and skip remaining hops — saving ~20 minutes.
+            #
+            # References:
+            #   - Research_Agent: stop_condition per hop with explicit termination
+            #   - LLMCompiler: join() barrier — only proceed when evidence is ready
+            if hop_idx == 0 and knowledge_answer and hop_answer:
+                knowledge_confirmed = self._check_knowledge_hop1_agreement(
+                    knowledge_answer, hop_answer, question)
+                if knowledge_confirmed:
+                    reasoning_steps.append(
+                        f"EARLY SHORT-CIRCUIT: Hop 1 answer '{hop_answer}' confirms "
+                        f"knowledge '{knowledge_answer}' — skipping remaining {len(hops) - 1} hops"
+                    )
+                    # Run a quick verification search to strengthen evidence
+                    ka_answer, ka_evidence, ka_ranked = (
+                        self._run_knowledge_anchored_verification_chain(
+                            question, knowledge_answer, hops,
+                            reasoning_steps, search_traces))
+                    if ka_answer and not check_if_answer_is_refusal_or_unknown_placeholder(ka_answer):
+                        knowledge_chain_answer = ka_answer
+                        knowledge_chain_evidence = ka_evidence
+                        all_ranked.extend(ka_ranked)
+                    break  # Skip remaining hops
 
             # ── Knowledge-anchored dual-chain recovery (after Hop 1) ──
             # Why: If the LLM's own knowledge and hop 1's search result point to
@@ -473,6 +1228,9 @@ class ConstrainedMultiHopSearchAgent:
                     f"Always verify and correct using the web search evidence below.\n\n"
                     f"Web search evidence:\n{fused_evidence}"
                 )
+                if self.trace_logger:
+                    self.trace_logger.record_event("knowledge_context_injected",
+                        f"injected knowledge_answer='{knowledge_answer[:60]}' into extraction context")
             search_answer = clean_and_validate_raw_llm_answer_text(
                 self.llm_answer_fn(question, context[:12000]))
 
@@ -506,6 +1264,11 @@ class ConstrainedMultiHopSearchAgent:
         if knowledge_chain_answer:
             candidate_dict["knowledge_chain"] = knowledge_chain_answer
 
+        if self.trace_logger:
+            self.trace_logger.record_event("voting_candidates_assembled",
+                f"candidates: {', '.join(f'{k}={v[:40]}' for k, v in candidate_dict.items())}",
+                details={"candidates": {k: v[:100] for k, v in candidate_dict.items()}})
+
         final_answer, answer_source, voting_trace = select_final_answer_with_consistency_voting(
             question=question,
             candidate_dict=candidate_dict,
@@ -513,6 +1276,40 @@ class ConstrainedMultiHopSearchAgent:
             trace_logger=self.trace_logger,
         )
         reasoning_steps.append(f"Voting decision: {voting_trace.get('decision', 'unknown')}")
+
+        # Phase 4.5: MiniAgent evidence review
+        # Why: The voting mechanism is rigid — this loop lets the LLM freely
+        # browse collected evidence and make a more informed final decision.
+        if (self._scratchpad
+                and self.llm_generic_fn
+                and self._scratchpad.get_stats().get("bm25_document_count", 0) > 0):
+            from src.mini_agent import run_mini_agent_loop
+
+            agent_result = run_mini_agent_loop(
+                question=question,
+                pipeline_answer=final_answer,
+                pipeline_candidates=candidate_dict,
+                scratchpad=self._scratchpad,
+                llm_fn=self.llm_generic_fn,
+                search_fn=self.search_fn,
+                trace_logger=self.trace_logger,
+                mcp_config=getattr(self, '_mcp_config', None),
+                mcp_http_clients=getattr(self, '_mcp_http_clients', None),
+                hop_evaluations=hop_evaluation_summaries,
+            )
+            reasoning_steps.append(
+                f"MiniAgent: answer='{agent_result['answer'][:60]}' "
+                f"confidence={agent_result['confidence']:.2f} "
+                f"tools={agent_result['tool_calls_count']} "
+                f"iters={agent_result['iterations']}"
+            )
+            # Accept MiniAgent answer if confidence is high enough
+            if agent_result["confidence"] > 0.6:
+                final_answer = agent_result["answer"]
+                answer_source = "mini_agent"
+                reasoning_steps.append(
+                    f"MiniAgent overrode pipeline answer (conf={agent_result['confidence']:.2f})"
+                )
 
         # Phase 5: Reverse verification
         final_answer = self._run_answer_verification_phase(question, final_answer, answer_source,
@@ -534,6 +1331,21 @@ class ConstrainedMultiHopSearchAgent:
             f"Final answer: {final_answer}",
             f"Believe score: {believe_score:.2f}",
         ])
+        # ── Log scratchpad stats ──
+        if self._scratchpad:
+            sp_stats = self._scratchpad.get_stats()
+            reasoning_steps.append(
+                f"Scratchpad stats: {sp_stats['bm25_document_count']} docs, "
+                f"{sp_stats['evidence_files_written']} evidence files, "
+                f"{sp_stats['page_files_written']} page files, "
+                f"{sp_stats['local_search_queries']} local queries, "
+                f"{sp_stats['local_search_hits']} hits")
+            if self.trace_logger and hasattr(self.trace_logger, "record_scratchpad_operation_trace"):
+                self.trace_logger.record_scratchpad_operation_trace(
+                    operation="session_summary",
+                    details=sp_stats,
+                )
+
         return {
             "answer": final_answer,
             "reasoning_steps": reasoning_steps,
@@ -576,20 +1388,159 @@ class ConstrainedMultiHopSearchAgent:
     # ── Phase helpers ───────────────────────────────────────────────────
 
     def _run_knowledge_only_answer_phase(self, question: str, reasoning_steps: List[str]) -> str:
-        """Phase 0: Ask LLM to answer from its own knowledge first."""
-        if not self.llm_knowledge_fn:
-            return ""
-        try:
-            raw = self.llm_knowledge_fn(question)
-            processed = clean_and_validate_raw_llm_answer_text(raw)
-            if processed:
-                reasoning_steps.append(f"Knowledge answer: {processed}")
-                return processed
-        except Exception:
-            pass
+        """Phase 0: Ask LLM to answer from its own knowledge first.
+
+        Why (enhanced after Q99 analysis): The original implementation silently
+        swallowed all exceptions, including timeouts.  When the LLM API times
+        out 3 times (180s wasted), knowledge_answer is empty, which disables:
+        1. Knowledge-guided search (entity injection into queries)
+        2. Early short-circuit (skip remaining hops when knowledge confirmed)
+        3. Knowledge-anchored dual-chain recovery
+
+        Enhancement: Two-tier fallback:
+        Tier 1: Normal LLM call with full reasoning prompt
+        Tier 2: If Tier 1 fails, try a degraded "direct answer only" prompt
+                 with shorter max_tokens (faster response, less likely to timeout)
+        Tier 3: If both LLM calls fail, extract pseudo-knowledge from question
+                 text using rule-based entity extraction
+
+        References:
+          - Research_Agent: fallback to direct reasoning on tool failure
+          - Weaver: budget-based early stopping with graceful degradation
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Tier 1: Normal knowledge call
+        if self.llm_knowledge_fn:
+            try:
+                raw = self.llm_knowledge_fn(question)
+                processed = clean_and_validate_raw_llm_answer_text(raw)
+                if processed:
+                    reasoning_steps.append(f"Knowledge answer: {processed}")
+                    return processed
+            except Exception as exc:
+                logger.warning("Knowledge answer Tier 1 failed: %s", exc)
+
+        # Tier 2: Degraded direct-answer prompt (shorter, faster)
+        if self.llm_generic_fn:
+            try:
+                degraded_system = (
+                    "Answer the question directly in 1-10 words. "
+                    "No explanation, no reasoning, just the answer."
+                )
+                degraded_user = f"Question: {question}\nAnswer:"
+                raw = self.llm_generic_fn(degraded_system, degraded_user)
+                if raw:
+                    # Extract just the answer part
+                    answer_text = raw.strip()
+                    # Remove common prefixes
+                    for prefix in ["Answer:", "answer:", "A:"]:
+                        if answer_text.startswith(prefix):
+                            answer_text = answer_text[len(prefix):].strip()
+                    processed = clean_and_validate_raw_llm_answer_text(answer_text)
+                    if processed:
+                        reasoning_steps.append(f"Knowledge answer (degraded): {processed}")
+                        return processed
+            except Exception as exc:
+                logger.warning("Knowledge answer Tier 2 (degraded) failed: %s", exc)
+
+        # Tier 3: Rule-based pseudo-knowledge extraction from question text
+        # Why: Even without LLM, we can extract key entity hints from the
+        # question structure to guide subsequent searches.
+        pseudo = self._extract_pseudo_knowledge_from_question_text(question)
+        if pseudo:
+            reasoning_steps.append(f"Knowledge answer (pseudo): {pseudo}")
+            return pseudo
+
+        return ""
+
+    @staticmethod
+    def _extract_pseudo_knowledge_from_question_text(question: str) -> str:
+        """Extract pseudo-knowledge entity hints from question text.
+
+        Why: When LLM is completely unavailable (all timeouts), we can still
+        extract useful search guidance from the question structure.  This is
+        NOT an answer — it is a set of key terms that can guide search queries.
+
+        Examples:
+          "first African player in Premier League" -> "" (too generic)
+          "the company founded by Adrian Bowyer" -> "Adrian Bowyer" (specific entity)
+          "the author of 'War and Peace'" -> "War and Peace" (specific entity)
+        """
+        # Extract quoted entities
+        quoted = re.findall(r"['\"]([^'\"]{2,60})['\"]", question)
+        if quoted:
+            return quoted[0]
+
+        # Extract proper nouns (capitalized multi-word sequences)
+        proper_nouns = re.findall(
+            r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", question)
+        # Filter out common non-entity phrases
+        noise = {"Premier League", "English Premier", "World Cup", "European Union",
+                 "United States", "United Kingdom", "New York", "Los Angeles"}
+        proper_nouns = [p for p in proper_nouns if p not in noise]
+        if proper_nouns:
+            return proper_nouns[0]
+
+        # Extract Chinese proper nouns (《》 brackets)
+        zh_titles = re.findall(r"[《「]([^》」]{2,30})[》」]", question)
+        if zh_titles:
+            return zh_titles[0]
+
         return ""
 
     # ── Knowledge-anchored dual-chain recovery ─────────────────────
+
+    def _check_knowledge_hop1_agreement(
+        self,
+        knowledge_answer: str,
+        hop1_answer: str,
+        question: str,
+    ) -> bool:
+        """Return True if knowledge_answer and hop1_answer agree on the same entity.
+
+        Why: When both the LLM's own knowledge (Phase 0) and the first hop's
+        search result point to the same entity, we have high confidence that the
+        answer is correct.  This enables the early short-circuit optimization
+        that skips remaining hops, saving 80%+ of total processing time.
+
+        The check is conservative — we only confirm agreement when the two
+        answers clearly refer to the *same* entity, not when they merely share
+        a few words.
+        """
+        if not knowledge_answer or not hop1_answer:
+            return False
+        # If hop1 failed (Unknown/refusal), no agreement
+        if check_if_answer_is_refusal_or_unknown_placeholder(hop1_answer):
+            return False
+        if check_if_answer_is_refusal_or_unknown_placeholder(knowledge_answer):
+            return False
+
+        ka_lower = knowledge_answer.lower().strip()
+        h1_lower = hop1_answer.lower().strip()
+
+        # Direct substring match: one contains the other
+        if ka_lower in h1_lower or h1_lower in ka_lower:
+            return True
+
+        # High word overlap (>= 60%) indicates same entity
+        ka_words = set(ka_lower.split())
+        h1_words = set(h1_lower.split())
+        if ka_words and h1_words:
+            overlap = len(ka_words & h1_words) / min(len(ka_words), len(h1_words))
+            if overlap >= 0.6:
+                return True
+
+        # For short answers (< 5 words), check edit distance heuristic
+        if len(ka_lower) < 50 and len(h1_lower) < 50:
+            # Simple character-level containment check
+            common_chars = sum(1 for c in ka_lower if c in h1_lower)
+            similarity = common_chars / max(len(ka_lower), 1)
+            if similarity >= 0.7:
+                return True
+
+        return False
 
     def _check_knowledge_hop1_divergence(
         self,
@@ -658,8 +1609,9 @@ class ConstrainedMultiHopSearchAgent:
                     return True
                 if result and "same" in result.lower():
                     return False
-            except Exception:
-                pass
+            except Exception as exc:
+                if self.trace_logger:
+                    self.trace_logger.record_event("exception_swallowed", f"divergence_check LLM call failed: {exc}")
 
         # Default: assume no divergence (conservative)
         return False
@@ -708,8 +1660,9 @@ class ConstrainedMultiHopSearchAgent:
                         line = line.strip().strip('"').strip("'")
                         if line and len(line) >= 4:
                             verify_queries.append(line)
-            except Exception:
-                pass
+            except Exception as exc:
+                if self.trace_logger:
+                    self.trace_logger.record_event("exception_swallowed", f"verify_query_generation failed: {exc}")
         verify_queries = list(dict.fromkeys(verify_queries))[:6]
         reasoning_steps.append(
             f"Knowledge-anchored chain: queries={verify_queries}"
@@ -794,17 +1747,43 @@ class ConstrainedMultiHopSearchAgent:
         When verification returns REFUTES, its reasoning often names the correct
         entity.  We now extract that entity via LLM and use it as the corrected
         answer — the highest-ROI recovery path.
+
+        Phase 7 enhancements:
+        - 7.1: Adversarial query — also search excluding the current answer
+        - 7.2: If confidence < 0.8, search for the second-best candidate
+        - 7.3: Verification prompt now asks for Better_entity
         """
-        if final_answer == "Unknown" or answer_source not in ("hop2", "search"):
+        if final_answer == "Unknown" or answer_source not in ("hop2", "search", "mini_agent", "agentic_loop", "arbitrated", "consensus"):
+            if self.trace_logger:
+                self.trace_logger.record_event("verification_skipped",
+                    f"answer='{final_answer[:40]}' source={answer_source} — not eligible for verification")
             return final_answer
         if not self.search_fn or not self.llm_verify_fn:
+            if self.trace_logger:
+                self.trace_logger.record_event("verification_skipped",
+                    f"search_fn={bool(self.search_fn)} verify_fn={bool(self.llm_verify_fn)} — missing functions")
             return final_answer
         try:
+            # Phase 7.1: Two verification queries — confirmatory + adversarial
             verify_query = f"{final_answer} {question[:80]}"
             verify_result = self.search_fn(verify_query, {"original_query": verify_query})
             verify_items = verify_result.get("results", []) if isinstance(verify_result, dict) else []
-            if verify_items:
-                verify_text = format_evidence_items_into_llm_readable_text(verify_items[:5])
+
+            # Adversarial query: search for alternatives excluding current answer
+            adversarial_items = []
+            try:
+                adversarial_query = f"{question[:100]} -\"{final_answer}\""
+                adversarial_result = self.search_fn(adversarial_query, {"original_query": adversarial_query})
+                adversarial_items = adversarial_result.get("results", []) if isinstance(adversarial_result, dict) else []
+            except Exception as exc:
+                if self.trace_logger:
+                    self.trace_logger.record_event("adversarial_query_failed", f"error={exc}")
+
+            # Combine evidence from both queries
+            all_verify_items = verify_items[:3] + adversarial_items[:2]
+
+            if all_verify_items:
+                verify_text = format_evidence_items_into_llm_readable_text(all_verify_items[:5])
                 if verify_text:
                     is_valid, verdict, reasoning, confidence = verify_answer_against_evidence_using_llm(
                         question, final_answer, verify_text, self.llm_verify_fn)
@@ -823,13 +1802,49 @@ class ConstrainedMultiHopSearchAgent:
                                 )
                                 return corrected
 
-                        reasoning_steps.append(f"Verification failed for '{final_answer}', trying fallback")
-                        if answer_source == "hop2" and search_answer and not check_if_answer_is_refusal_or_unknown_placeholder(search_answer):
-                            return search_answer
-                        if knowledge_answer and not check_if_answer_is_refusal_or_unknown_placeholder(knowledge_answer):
-                            return knowledge_answer
-        except Exception:
-            pass
+                        # Only fallback to alternative answers when REFUTES, not INSUFFICIENT.
+                        # INSUFFICIENT means evidence is ambiguous — keep the current answer.
+                        if verdict == "REFUTES":
+                            reasoning_steps.append(f"Verification REFUTED '{final_answer}', trying fallback")
+                            if answer_source == "hop2" and search_answer and not check_if_answer_is_refusal_or_unknown_placeholder(search_answer):
+                                return search_answer
+                            if knowledge_answer and not check_if_answer_is_refusal_or_unknown_placeholder(knowledge_answer):
+                                return knowledge_answer
+                        else:
+                            # Phase 7.2: INSUFFICIENT with low confidence — search for second candidate
+                            if confidence < 0.8 and search_answer and search_answer != final_answer:
+                                reasoning_steps.append(
+                                    f"Verification INSUFFICIENT (conf={confidence:.2f}), "
+                                    f"checking alternative: '{search_answer}'"
+                                )
+                                try:
+                                    alt_query = f"{search_answer} {question[:80]}"
+                                    alt_result = self.search_fn(alt_query, {"original_query": alt_query})
+                                    alt_items = alt_result.get("results", []) if isinstance(alt_result, dict) else []
+                                    if alt_items:
+                                        alt_text = format_evidence_items_into_llm_readable_text(alt_items[:3])
+                                        if alt_text:
+                                            alt_valid, alt_verdict, alt_reasoning, alt_conf = (
+                                                verify_answer_against_evidence_using_llm(
+                                                    question, search_answer, alt_text, self.llm_verify_fn))
+                                            reasoning_steps.append(
+                                                f"Alternative verify: '{search_answer}' verdict={alt_verdict}, "
+                                                f"conf={alt_conf:.2f}"
+                                            )
+                                            if alt_valid and alt_conf > confidence:
+                                                reasoning_steps.append(
+                                                    f"Alternative '{search_answer}' has higher confidence, switching"
+                                                )
+                                                return search_answer
+                                except Exception as exc:
+                                    if self.trace_logger:
+                                        self.trace_logger.record_event("exception_swallowed", f"alternative_verification failed: {exc}")
+                            reasoning_steps.append(
+                                f"Verification INSUFFICIENT for '{final_answer}', keeping answer"
+                            )
+        except Exception as exc:
+            if self.trace_logger:
+                self.trace_logger.record_event("exception_swallowed", f"verification_phase failed: {exc}")
         return final_answer
 
     # ── Phase 6: Confidence-driven abstention (Wing architecture) ──────

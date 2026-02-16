@@ -9,6 +9,7 @@ This script runs ONLY question[0] and then validates every log file.
 """
 
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -25,13 +26,20 @@ QUESTIONS_FILE = BASE_DIR / "data" / "qa" / "question.json"
 
 
 def load_first_question() -> dict:
-    """Load only the first question from the dataset."""
+    """Load a question from the dataset by index (default: 0).
+
+    Set QUESTION_INDEX env var to change which question to test.
+    """
+    target_idx = int(os.environ.get("QUESTION_INDEX", "0"))
     with open(QUESTIONS_FILE, "r", encoding="utf-8") as fh:
+        idx = 0
         for line in fh:
             line = line.strip()
             if line:
-                return json.loads(line)
-    raise RuntimeError("No questions found in question.json")
+                if idx == target_idx:
+                    return json.loads(line)
+                idx += 1
+    raise RuntimeError(f"Question index {target_idx} not found in question.json")
 
 
 def verify_log_file(file_path: Path, expected_format: str) -> dict:

@@ -21,7 +21,10 @@ from typing import Any, Dict, Optional
 
 # After this many consecutive failures in a single run, the dispatcher
 # automatically skips the engine for subsequent queries.
-_MAX_FAIL_STREAK = 3
+# Raised from 3 to 5: BrightData can be intermittently slow but usually recovers.
+# 3 consecutive failures was too aggressive — it skipped BrightData mid-run when
+# the service was merely slow, not down.
+_MAX_FAIL_STREAK = 5
 
 from src.search.abstract_search_client_interface import AbstractSearchClientInterface
 from src.search.brave_web_search_client import BraveWebSearchClient
@@ -175,12 +178,13 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
         if results_list:
             enrich_search_results_with_full_page_content(
                 results_list,
-                top_n=3,
+                top_n=3,  # Restored from 2: more pages = better evidence coverage
                 max_content_length=5000,
                 query=search_query,
                 llm_refine_fn=getattr(self, "_llm_refine_fn", None),
                 enable_llm_refinement=getattr(self, "_enable_llm_refinement", False),
                 trace_logger=self.trace_logger,
+                scratchpad=getattr(self, "scratchpad", None),
             )
         return result
 
@@ -258,10 +262,27 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
         culture/news).  Falls back to language-based default chain.
         """
         meta = meta or {}
-        is_chinese = check_if_text_is_primarily_chinese_characters(query)
+        # Respect question-level language priority from the geographic router.
+        # Why: Hop planning may generate Chinese queries for an English question
+        # (e.g. "约翰·梅森·尼尔 创立 女性宗教团体").  Character-level detection
+        # would incorrectly route these to IQS.  The geographic router analyzed
+        # the ORIGINAL question and determined the correct language priority.
+        language_priority = meta.get("language_priority", "")
+        if language_priority == "english_first":
+            is_chinese = False
+        elif language_priority == "chinese_first":
+            is_chinese = True
+        else:
+            is_chinese = check_if_text_is_primarily_chinese_characters(query)
         domain = meta.get("domain", "")
         engine_chain = self._resolve_engine_chain(is_chinese, domain)
         lang_tag = "ZH" if is_chinese else "EN"
+
+        if self.trace_logger and hasattr(self.trace_logger, "record_event"):
+            self.trace_logger.record_event("language_detected",
+                f"lang={lang_tag} priority={language_priority or 'char_detect'} q='{query[:60]}'")
+            self.trace_logger.record_event("engine_chain_resolved",
+                f"chain={[e[0] for e in engine_chain]} domain={domain or 'default'} lang={lang_tag}")
 
         fallback_result = {
             "service": "hybrid-dispatcher",
@@ -275,6 +296,9 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
             if not self._is_engine_usable(engine_name):
                 logger.info("%s disabled/unavailable for %s/%s query: %s",
                             display_name, lang_tag, domain or "default", query[:60])
+                if self.trace_logger and hasattr(self.trace_logger, "record_event"):
+                    self.trace_logger.record_event("engine_skipped",
+                        f"engine={engine_name} lang={lang_tag} domain={domain or 'default'} q='{query[:40]}'")
                 continue
             client = getattr(self, engine_name, None)
             if client is None:
@@ -283,6 +307,9 @@ class LanguageAwareHybridSearchDispatcher(AbstractSearchClientInterface):
             if not result.get("error") and result.get("count", 0) > 0:
                 self._record_engine_success(engine_name)
                 if engine_name == "iqs":
+                    if self.trace_logger and hasattr(self.trace_logger, "record_event"):
+                        self.trace_logger.record_event("iqs_early_return",
+                            f"IQS returned {result.get('count',0)} results, skipping enrichment")
                     return result
                 return self._enrich_non_iqs_results_with_page_content(result)
             self._record_engine_failure(engine_name)

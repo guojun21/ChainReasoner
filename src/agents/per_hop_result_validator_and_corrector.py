@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # P0-f: Increased from 2 to 3 — two cycles was often insufficient when the
 # first round returned low-quality evidence (especially for multi-hop chains
 # where the first search needs refinement).
-MAX_RETRIEVAL_CYCLES_PER_HOP = 3
+MAX_RETRIEVAL_CYCLES_PER_HOP = 2  # Reduced from 3: saves ~33% LLM calls per hop
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +93,7 @@ def evaluate_hop_result_and_decide_next_action(
         '  "valid": true/false,\n'
         '  "confidence": 0.0-1.0,\n'
         '  "extracted_entity": "the key entity/name/date/number found in this hop",\n'
+        '  "alternative_entities": ["other possible entity 1", "other possible entity 2"],\n'
         '  "next_action": "continue" or "refine" or "sufficient",\n'
         '  "missing_info": "what specific information is still missing (or empty if sufficient)",\n'
         '  "is_chain_complete": true/false,\n'
@@ -102,10 +103,14 @@ def evaluate_hop_result_and_decide_next_action(
         "Rules:\n"
         '- "valid"=true ONLY if the result clearly contains info satisfying the stop condition\n'
         '- "extracted_entity": extract the EXACT entity/name/number — do NOT paraphrase\n'
+        '- "alternative_entities": list up to 2 OTHER plausible entities from the evidence. '
+        "This is CRITICAL to avoid confirmation bias — always consider alternatives!\n"
         '- "next_action"="sufficient" if we have enough evidence to answer the original question\n'
         '- "next_action"="refine" if this hop\'s search missed the target — need better queries\n'
         '- "next_action"="continue" if this hop is done but we need more hops\n'
         '- "is_chain_complete"=true ONLY if accumulated evidence fully answers the original question\n'
+        "- ANTI-CONFIRMATION BIAS: If the evidence is ambiguous or mentions multiple entities, "
+        "do NOT just pick the first one. List all plausible candidates in alternative_entities.\n"
         "- Output ONLY the JSON, nothing else"
     )
     user_prompt = (
@@ -136,6 +141,10 @@ def evaluate_hop_result_and_decide_next_action(
             result["valid"] = bool(result.get("valid", False))
             result["confidence"] = float(result.get("confidence", 0.5))
             result.setdefault("extracted_entity", "")
+            result.setdefault("alternative_entities", [])
+            # Ensure alternative_entities is a list
+            if not isinstance(result.get("alternative_entities"), list):
+                result["alternative_entities"] = []
             result.setdefault("next_action", "continue")
             result.setdefault("missing_info", "")
             result["is_chain_complete"] = bool(result.get("is_chain_complete", False))
